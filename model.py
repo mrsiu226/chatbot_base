@@ -1,4 +1,3 @@
-# models.py
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 import os
