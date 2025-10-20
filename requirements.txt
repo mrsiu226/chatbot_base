@@ -25,3 +25,4 @@ torch
 gspread
 google-auth
 google-auth-oauthlib
+google-generativeai

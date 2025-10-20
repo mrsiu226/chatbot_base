@@ -52,13 +52,10 @@ def history():
     history = get_all_messages(user_id)
     return jsonify(history)
 
-
 # ========== HELPER FUNCTIONS ==========
 
 def match_embeddings(query_vector, top_k=5):
-    """
-    Gọi RPC match_embeddings trong Supabase để tìm các đoạn văn gần nhất.
-    """
+    """Gọi RPC match_embeddings trong Supabase để tìm các đoạn văn gần nhất."""
     try:
         response = supabase.rpc("match_embeddings", {
             "query_embedding": query_vector,
@@ -68,8 +65,7 @@ def match_embeddings(query_vector, top_k=5):
         results = response.data or []
         if not results:
             return "Không tìm thấy ngữ cảnh liên quan."
-        
-        # Ghép các đoạn text lại thành context
+
         context_text = "\n".join([
             f"- {r['text']} (sheet: {r['sheet_name']}, col: {r['column_name']})"
             for r in results
@@ -77,32 +73,24 @@ def match_embeddings(query_vector, top_k=5):
         return context_text
 
     except Exception as e:
-        print(f"❌ Lỗi khi gọi match_embeddings: {e}")
+        print(f"Lỗi khi gọi match_embeddings: {e}")
         return "Không thể truy xuất ngữ cảnh."
 
-
-
 def build_prompt(user_msg, short_term_context, long_term_context):
-    """
-    Xây dựng prompt đầy đủ với 3 lớp context:
-    - short-term: hội thoại gần nhất
-    - long-term: dữ liệu vector từ DB (qua RPC)
-    - câu hỏi hiện tại
-    """
-    system_prompt = """Bạn là chatbot hỗ trợ tư vấn cá nhân hóa.
-    - Dùng short-term context để giữ mạch hội thoại gần nhất.
-    - Dùng long-term context để cung cấp thông tin nền từ dữ liệu vector.
-    - Nếu có mâu thuẫn thì ưu tiên short-term context.
-    """
+    """Ghép prompt với short-term + long-term context."""
+    system_prompt = """Bạn là chatbot tư vấn cá nhân hóa.
+- Dùng short-term context để giữ mạch hội thoại.
+- Dùng long-term context để bổ sung kiến thức nền.
+- Nếu có mâu thuẫn, ưu tiên short-term context.
+"""
     context_prompt = f"""
-    [Long-term context]
-    {long_term_context if long_term_context else "Không có dữ liệu"}
+[Long-term context]
+{long_term_context or "Không có dữ liệu"}
 
-    [Short-term context]
-    {short_term_context if short_term_context else "Không có lịch sử gần đây"}
-    """
+[Short-term context]
+{short_term_context or "Không có lịch sử gần đây"}
+"""
     return f"{system_prompt}\n{context_prompt}\nUser: {user_msg}\nChatbot:"
-
 
 # ========== MAIN CHAT ENDPOINT ==========
 
@@ -113,53 +101,51 @@ def chat():
 
     data = request.json or {}
     user_msg = data.get("message", "").strip()
-    provider = data.get("provider", "google")
+    model_key = data.get("model", "gemini-flash")  # mặc định model chính
 
     if not user_msg:
         return Response("Message không được để trống", status=400)
 
-    llm = models.get(provider)
-    if not llm:
-        return Response(f"Provider {provider} không hợp lệ", status=400)
+    # --- Lấy model từ danh sách ---
+    model_entry = models.get(model_key)
+    if not model_entry:
+        return Response(f"Model '{model_key}' không hợp lệ", status=400)
 
+    llm = model_entry["model"]
     user_id = session["user"]["id"]
 
-    # --- B1: Sinh embedding cho user message ---
+    # --- Sinh embedding cho câu hỏi ---
     query_vector = embedder.embed(user_msg).tolist()
 
-    # --- B2: Lấy short-term context ---
+    # --- Lấy short-term context ---
     short_history = get_latest_messages(user_id, 8)
     short_term_context = "\n".join([
         f"User: {h['message']}\nBot: {h['reply']}"
         for h in reversed(short_history)
     ])
 
-    # --- B3: Gọi RPC match_embeddings để tìm context gần nhất ---
+    # --- Lấy long-term context ---
     long_term_context = match_embeddings(query_vector, top_k=5)
 
-    # --- B4: Ghép context + prompt ---
+    # --- Xây prompt hoàn chỉnh ---
     prompt = build_prompt(user_msg, short_term_context, long_term_context)
 
-    # --- B5: Stream phản hồi từ LLM ---
+    # --- Stream phản hồi ---
     @stream_with_context
     def generate():
         buffer = ""
         try:
             for chunk in llm.stream(prompt):
-                if hasattr(chunk, "content") and chunk.content:
-                    buffer += chunk.content
-                    yield chunk.content
-
-            # Sau khi trả lời xong -> lưu vào DB
+                content = getattr(chunk, "content", "")
+                if content:
+                    buffer += content
+                    yield content
             insert_message(user_id, user_msg, buffer)
-
         except Exception as e:
             yield f"\n[ERROR]: {str(e)}"
 
     return Response(generate(), mimetype="text/plain")
 
-
 # ========== MAIN ==========
-
 if __name__ == "__main__":
     app.run(debug=True)
