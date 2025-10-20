@@ -176,13 +176,14 @@
     <div class="chatbot-header">
       <div class="chatbot-title">🤖 Chatbot</div>
       <div class="custom-select" id="providerSelect">
-        <div class="selected">Gemini 2.5 Flash Lite</div>
+        <div class="selected">Gemini 2.5 Pro</div>
         <div class="options">
-          <!-- <div data-value="gemini-flash">Gemini Flash</div> -->
-          <div data-value="gemini-flash-lite">Gemini 2.5 Flash Lite</div>
-          <div data-value="deepseek-chat">DeepSeek Chat</div>
-          <div data-value="deepseek-reasoner">DeepSeek Reasoner</div>
-          <div data-value="grok-2">Grok 2</div>
+          <div data-provider="google" data-model="gemini-pro">Gemini 2.5 Pro</div>
+          <div data-provider="google" data-model="gemini-flash">Gemini 2.0 Flash</div>
+          <div data-provider="google" data-model="gemini-flash-lite">Gemini 2.0 Flash Lite</div>
+          <div data-provider="deepseek" data-model="deepseek-chat">DeepSeek Chat</div>
+          <!-- <div data-provider="deepseek" data-model="deepseek-reasoner">DeepSeek Reasoner</div> -->
+          <div data-provider="grok" data-model="grok-2">Grok 2</div>
         </div>
       </div>
       <div style="margin-left:8px;cursor:pointer" id="close-btn">✖</div>
@@ -208,7 +209,8 @@
   const providerSelect = document.getElementById("providerSelect");
   const selected = providerSelect.querySelector(".selected");
   const options = providerSelect.querySelector(".options");
-  let currentProvider = "gemini-flash";
+  let currentProvider = "google";
+  let currentModel = "gemini-pro";
 
   // Toggle chatbot
   toggleBtn.addEventListener("click", () => {
@@ -229,7 +231,8 @@
   options.querySelectorAll("div").forEach(opt => {
     opt.addEventListener("click", () => {
       selected.innerText = opt.innerText;
-      currentProvider = opt.dataset.value;
+      currentProvider = opt.dataset.provider;
+      currentModel = opt.dataset.model;
       providerSelect.classList.remove("open");
     });
   });
