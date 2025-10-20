@@ -1,9 +1,4 @@
-# models.py
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
-    
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 import os
 from dotenv import load_dotenv
