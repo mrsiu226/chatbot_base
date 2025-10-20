@@ -23,7 +23,7 @@ class Embedder:
     def embed(self, text: str):
         """Sinh embedding cho 1 câu"""
         if not self.model:
-            raise ValueError("❌ Model chưa sẵn sàng.")
+            raise ValueError("Model chưa sẵn sàng.")
         return self.model.encode(text, convert_to_numpy=True)
 
 

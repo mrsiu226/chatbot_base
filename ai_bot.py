@@ -2,23 +2,30 @@ from flask import Flask, request, Response, stream_with_context, redirect, sessi
 from dotenv import load_dotenv
 from model import models
 from data.import_data import insert_message
-from data.get_history import get_latest_messages, get_all_messages, get_long_term_context
-# from utils.elicitation import elicitation_trigger
+from data.get_history import get_latest_messages, get_all_messages
+from data.embed_messages import embedder
+from supabase import create_client
 import os, json
+
+# ---------------- CONFIG ----------------
+load_dotenv()
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+app = Flask(__name__, static_folder="static", static_url_path="")
+app.secret_key = "super-secret-key"
+
+# ========== BLUEPRINT LOGIN ==========
 from login.register import register_bp
 from login.login import login_bp  
-
-load_dotenv()
-app = Flask(__name__, static_folder="static", static_url_path="")
-app.secret_key = "super-secret-key"  # cần cho session
-
-# đăng ký blueprint
 app.register_blueprint(register_bp)
 app.register_blueprint(login_bp)
 
+# ========== ROUTES ==========
+
 @app.route("/")
 def index():
-    # nếu chưa login thì bắt về trang login
     if not session.get("user"):
         return redirect("/login-ui")
     return redirect("/chatbot")
@@ -45,46 +52,60 @@ def history():
     history = get_all_messages(user_id)
     return jsonify(history)
 
-# @app.route("/suggestions", methods=["POST"])
-# def suggestions():
-#     if not session.get("user"):
-#         return jsonify([]), 401
 
-#     user_id = session["user"]["id"]
+# ========== HELPER FUNCTIONS ==========
 
-#     # lấy lịch sử mới nhất (1 tin nhắn gần nhất)
-#     history = get_latest_messages(user_id, 1)
-#     if not history:
-#         return jsonify([])
+def match_embeddings(query_vector, top_k=5):
+    """
+    Gọi RPC match_embeddings trong Supabase để tìm các đoạn văn gần nhất.
+    """
+    try:
+        response = supabase.rpc("match_embeddings", {
+            "query_embedding": query_vector,
+            "match_count": top_k
+        }).execute()
 
-#     last_user_msg = history[-1]["message"]  # lấy message cuối cùng của user
+        results = response.data or []
+        if not results:
+            return "Không tìm thấy ngữ cảnh liên quan."
+        
+        # Ghép các đoạn text lại thành context
+        context_text = "\n".join([
+            f"- {r['text']} (sheet: {r['sheet_name']}, col: {r['column_name']})"
+            for r in results
+        ])
+        return context_text
 
-#     from utils.elicitation import elicitation_trigger
-#     suggested_questions = elicitation_trigger(last_user_msg)
+    except Exception as e:
+        print(f"❌ Lỗi khi gọi match_embeddings: {e}")
+        return "Không thể truy xuất ngữ cảnh."
 
-#     return jsonify(suggested_questions)
 
 
-# ===== Prompt Builder =====
 def build_prompt(user_msg, short_term_context, long_term_context):
-    system_prompt = """Bạn là chatbot hỗ trợ cá nhân hóa.
-- Dùng short-term context để giữ mạch hội thoại gần nhất.
-- Dùng long-term context để nhớ thông tin lâu dài của user.
-- Nếu có mâu thuẫn thì ưu tiên short-term context.
-"""
-
+    """
+    Xây dựng prompt đầy đủ với 3 lớp context:
+    - short-term: hội thoại gần nhất
+    - long-term: dữ liệu vector từ DB (qua RPC)
+    - câu hỏi hiện tại
+    """
+    system_prompt = """Bạn là chatbot hỗ trợ tư vấn cá nhân hóa.
+    - Dùng short-term context để giữ mạch hội thoại gần nhất.
+    - Dùng long-term context để cung cấp thông tin nền từ dữ liệu vector.
+    - Nếu có mâu thuẫn thì ưu tiên short-term context.
+    """
     context_prompt = f"""
-[Long-term context]
-{long_term_context if long_term_context else "Không có dữ liệu"}
+    [Long-term context]
+    {long_term_context if long_term_context else "Không có dữ liệu"}
 
-[Short-term context]
-{short_term_context if short_term_context else "Không có lịch sử gần đây"}
-"""
-
+    [Short-term context]
+    {short_term_context if short_term_context else "Không có lịch sử gần đây"}
+    """
     return f"{system_prompt}\n{context_prompt}\nUser: {user_msg}\nChatbot:"
 
 
-# ===== Chat Endpoint =====
+# ========== MAIN CHAT ENDPOINT ==========
+
 @app.route("/chat", methods=["POST"])
 def chat():
     if not session.get("user"):
@@ -101,25 +122,25 @@ def chat():
     if not llm:
         return Response(f"Provider {provider} không hợp lệ", status=400)
 
-    user = session.get("user")
-    if not user:
-        return Response("Bạn chưa đăng nhập", status=401)
+    user_id = session["user"]["id"]
 
-    user_id = user["id"]
+    # --- B1: Sinh embedding cho user message ---
+    query_vector = embedder.embed(user_msg).tolist()
 
-    # Short-term context: lấy từ lịch sử
+    # --- B2: Lấy short-term context ---
     short_history = get_latest_messages(user_id, 8)
-    short_term_context = "\n".join(
-        [f"User: {h['message']}\nBot: {h['reply']}" for h in reversed(short_history)]
-    )
+    short_term_context = "\n".join([
+        f"User: {h['message']}\nBot: {h['reply']}"
+        for h in reversed(short_history)
+    ])
 
-    # Long-term context: lấy từ DB / vector DB
-    long_term_context = get_long_term_context(user_id, user_msg)
+    # --- B3: Gọi RPC match_embeddings để tìm context gần nhất ---
+    long_term_context = match_embeddings(query_vector, top_k=5)
 
-    # Build prompt gọn gàng
+    # --- B4: Ghép context + prompt ---
     prompt = build_prompt(user_msg, short_term_context, long_term_context)
 
-    # Streaming
+    # --- B5: Stream phản hồi từ LLM ---
     @stream_with_context
     def generate():
         buffer = ""
@@ -127,21 +148,18 @@ def chat():
             for chunk in llm.stream(prompt):
                 if hasattr(chunk, "content") and chunk.content:
                     buffer += chunk.content
-                    yield chunk.content  # stream phần trả lời chính
+                    yield chunk.content
 
-            # Lưu message sau khi bot trả lời xong
+            # Sau khi trả lời xong -> lưu vào DB
             insert_message(user_id, user_msg, buffer)
 
-            # Sau khi trả lời xong => sinh suggested_questions
-            # suggested_questions = elicitation_trigger(short_term_context)
-
-            # Gửi block suggestion đặc biệt để frontend parse
-            # yield f"\n[SUGGESTIONS]: {json.dumps(suggested_questions, ensure_ascii=False)}"
         except Exception as e:
             yield f"\n[ERROR]: {str(e)}"
 
     return Response(generate(), mimetype="text/plain")
 
+
+# ========== MAIN ==========
 
 if __name__ == "__main__":
     app.run(debug=True)
