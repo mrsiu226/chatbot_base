@@ -1,5 +1,9 @@
 # models.py
-from langchain_google_genai import ChatGoogleGenerativeAI
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+    
 from langchain_openai import ChatOpenAI
 import os
 from dotenv import load_dotenv
@@ -39,12 +43,22 @@ deepseek_chat = ChatOpenAI(
 )
 
 # Grok (xAI)
-grok_chat = ChatOpenAI(
-    model="grok-2-latest",
-    temperature=0.7,
-    api_key=grok_api_key,
-    base_url="https://api.x.ai/v1",
-)
+if grok_api_key:
+    grok_chat = ChatOpenAI(
+        model="grok-2-latest",
+        temperature=0.7,
+        api_key=grok_api_key,
+        base_url="https://api.x.ai/v1",
+    )
+else:
+    # Fallback model
+    class DummyModel:
+        def stream(self, prompt):
+            yield type('obj', (object,), {'content': "Grok API key chưa được cấu hình"})
+        def invoke(self, prompt):
+            return type('obj', (object,), {'content': "Grok API key chưa được cấu hình"})
+    
+    grok_chat = DummyModel()
 
 models = {
     "gemini-flash": {"provider": "google", "model": gemini_flash},
