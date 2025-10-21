@@ -101,7 +101,7 @@ def chat():
 
     data = request.json or {}
     user_msg = data.get("message", "").strip()
-    model_key = data.get("model", "gemini-flash")  # mặc định model chính
+    model_key = data.get("model", "gemini-flash-lite")  # Default: nhanh nhất
 
     if not user_msg:
         return Response("Message không được để trống", status=400)

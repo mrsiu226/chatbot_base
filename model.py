@@ -30,22 +30,24 @@ class ModelWrapper:
         except Exception as e:
             return type('obj', (object,), {'content': f"Error with {self.name}: {str(e)}"})
 
-# Google Gemini REST API Wrapper
+# Google Gemini REST API Wrapper with streaming support
 class GeminiAPIWrapper:
     def __init__(self, model_name, api_key, temperature=0.7):
         self.model_name = model_name
         self.api_key = api_key
         self.temperature = temperature
-        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}"
+    
+    def _prepare_prompt(self, prompt):
+        """Convert prompt to string format"""
+        if isinstance(prompt, list):
+            return "\n".join([msg.get("content", str(msg)) for msg in prompt])
+        return str(prompt)
     
     def invoke(self, prompt):
-        """Call Gemini API directly"""
+        """Call Gemini API directly (non-streaming)"""
         try:
-            # Convert prompt to string if it's a list of messages
-            if isinstance(prompt, list):
-                prompt_text = "\n".join([msg.get("content", str(msg)) for msg in prompt])
-            else:
-                prompt_text = str(prompt)
+            prompt_text = self._prepare_prompt(prompt)
             
             payload = {
                 "contents": [{
@@ -58,10 +60,10 @@ class GeminiAPIWrapper:
             }
             
             response = requests.post(
-                f"{self.base_url}?key={self.api_key}",
+                f"{self.base_url}:generateContent?key={self.api_key}",
                 headers={"Content-Type": "application/json"},
                 json=payload,
-                timeout=30
+                timeout=15  # Giảm timeout xuống 15s
             )
             
             if response.status_code == 200:
@@ -72,21 +74,78 @@ class GeminiAPIWrapper:
                 else:
                     return type('obj', (object,), {'content': "No response from Gemini"})
             else:
-                error_msg = f"Gemini API error {response.status_code}: {response.text}"
+                error_msg = f"Gemini API error {response.status_code}: {response.text[:100]}"
                 print(f"[Gemini Error] {error_msg}")
                 return type('obj', (object,), {'content': error_msg})
                 
         except requests.exceptions.Timeout:
-            return type('obj', (object,), {'content': "Gemini API timeout"})
+            return type('obj', (object,), {'content': "Gemini API timeout (>15s)"})
         except Exception as e:
             error_msg = f"Gemini error: {str(e)}"
             print(f"[Gemini Exception] {error_msg}")
             return type('obj', (object,), {'content': error_msg})
     
     def stream(self, prompt):
-        """Stream is not natively supported, fallback to invoke"""
-        result = self.invoke(prompt)
-        yield result
+        """Stream response from Gemini API"""
+        try:
+            prompt_text = self._prepare_prompt(prompt)
+            
+            payload = {
+                "contents": [{
+                    "parts": [{"text": prompt_text}]
+                }],
+                "generationConfig": {
+                    "temperature": self.temperature,
+                    "maxOutputTokens": 2048,
+                }
+            }
+            
+            # Sử dụng streamGenerateContent endpoint
+            response = requests.post(
+                f"{self.base_url}:streamGenerateContent?key={self.api_key}&alt=sse",
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=30,
+                stream=True  # Enable streaming
+            )
+            
+            if response.status_code == 200:
+                # Parse SSE (Server-Sent Events) stream
+                accumulated_text = ""
+                for line in response.iter_lines():
+                    if line:
+                        line_str = line.decode('utf-8')
+                        # SSE format: "data: {...}"
+                        if line_str.startswith('data: '):
+                            json_str = line_str[6:]  # Remove "data: " prefix
+                            try:
+                                data = json.loads(json_str)
+                                if "candidates" in data and len(data["candidates"]) > 0:
+                                    parts = data["candidates"][0].get("content", {}).get("parts", [])
+                                    if parts and "text" in parts[0]:
+                                        chunk_text = parts[0]["text"]
+                                        accumulated_text += chunk_text
+                                        # Yield chunk
+                                        yield type('obj', (object,), {'content': chunk_text})
+                            except json.JSONDecodeError:
+                                continue
+                
+                # If no streaming data, fallback to invoke
+                if not accumulated_text:
+                    result = self.invoke(prompt)
+                    yield result
+            else:
+                error_msg = f"Gemini stream error {response.status_code}"
+                yield type('obj', (object,), {'content': error_msg})
+                
+        except requests.exceptions.Timeout:
+            yield type('obj', (object,), {'content': "Gemini stream timeout"})
+        except Exception as e:
+            error_msg = f"Gemini stream error: {str(e)}"
+            print(f"[Gemini Stream Exception] {error_msg}")
+            # Fallback to non-streaming
+            result = self.invoke(prompt)
+            yield result
 
 # DeepSeek models (primary - more reliable)
 if deepseek_api_key:
