@@ -1,5 +1,7 @@
 from langchain_openai import ChatOpenAI
 import os
+import requests
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,6 +29,64 @@ class ModelWrapper:
             return self.model.invoke(prompt)
         except Exception as e:
             return type('obj', (object,), {'content': f"Error with {self.name}: {str(e)}"})
+
+# Google Gemini REST API Wrapper
+class GeminiAPIWrapper:
+    def __init__(self, model_name, api_key, temperature=0.7):
+        self.model_name = model_name
+        self.api_key = api_key
+        self.temperature = temperature
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+    
+    def invoke(self, prompt):
+        """Call Gemini API directly"""
+        try:
+            # Convert prompt to string if it's a list of messages
+            if isinstance(prompt, list):
+                prompt_text = "\n".join([msg.get("content", str(msg)) for msg in prompt])
+            else:
+                prompt_text = str(prompt)
+            
+            payload = {
+                "contents": [{
+                    "parts": [{"text": prompt_text}]
+                }],
+                "generationConfig": {
+                    "temperature": self.temperature,
+                    "maxOutputTokens": 2048,
+                }
+            }
+            
+            response = requests.post(
+                f"{self.base_url}?key={self.api_key}",
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if "candidates" in data and len(data["candidates"]) > 0:
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    return type('obj', (object,), {'content': text})
+                else:
+                    return type('obj', (object,), {'content': "No response from Gemini"})
+            else:
+                error_msg = f"Gemini API error {response.status_code}: {response.text}"
+                print(f"[Gemini Error] {error_msg}")
+                return type('obj', (object,), {'content': error_msg})
+                
+        except requests.exceptions.Timeout:
+            return type('obj', (object,), {'content': "Gemini API timeout"})
+        except Exception as e:
+            error_msg = f"Gemini error: {str(e)}"
+            print(f"[Gemini Exception] {error_msg}")
+            return type('obj', (object,), {'content': error_msg})
+    
+    def stream(self, prompt):
+        """Stream is not natively supported, fallback to invoke"""
+        result = self.invoke(prompt)
+        yield result
 
 # DeepSeek models (primary - more reliable)
 if deepseek_api_key:
@@ -83,28 +143,34 @@ else:
     
     grok_chat = DummyModel()
 
-# Google models (tertiary - disabled for now due to timeout issues)
-class DummyModel:
-    def stream(self, prompt):
-        yield type('obj', (object,), {'content': "Google models tạm thời disabled do timeout issues"})
-    def invoke(self, prompt):
-        return type('obj', (object,), {'content': "Google models tạm thời disabled do timeout issues"})
+# Google Gemini models using REST API
+if google_api_key:
+    # Sử dụng các models mới nhất từ Gemini 2.5 và 2.0
+    gemini_flash = GeminiAPIWrapper("gemini-2.5-flash", google_api_key, temperature=0.7)
+    gemini_pro = GeminiAPIWrapper("gemini-2.5-pro", google_api_key, temperature=0.7)
+    gemini_flash_lite = GeminiAPIWrapper("gemini-2.5-flash-lite", google_api_key, temperature=0.7)
+else:
+    class DummyModelGoogle:
+        def stream(self, prompt):
+            yield type('obj', (object,), {'content': "Google API key chưa được cấu hình"})
+        def invoke(self, prompt):
+            return type('obj', (object,), {'content': "Google API key chưa được cấu hình"})
+    
+    gemini_flash = DummyModelGoogle()
+    gemini_pro = DummyModelGoogle()
+    gemini_flash_lite = DummyModelGoogle()
 
-gemini_flash = DummyModel()
-gemini_pro = DummyModel()
-gemini_flash_lite = DummyModel()
-
-# Dictionary để chọn model theo tên - ưu tiên Grok (vì DeepSeek hết credit)
+# Dictionary để chọn model theo tên
 models = {
     "grok-2": grok_chat,
     "deepseek-chat": deepseek_chat,
     "deepseek-reasoner": deepseek_reasoner,
-    "gemini-flash": grok_chat,  # Fallback to Grok
-    "gemini-pro": grok_chat,    # Fallback to Grok 
-    "gemini-flash-lite": grok_chat,  # Fallback to Grok
+    "gemini-flash": gemini_flash,
+    "gemini-pro": gemini_pro,
+    "gemini-flash-lite": gemini_flash_lite,
     # Aliases
-    "google": grok_chat,   # Fallback to Grok
-    "gemini": grok_chat,   # Fallback to Grok
+    "google": gemini_pro,
+    "gemini": gemini_pro,
 }
 
 # ✅ Test code
