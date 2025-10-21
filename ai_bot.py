@@ -111,7 +111,8 @@ def chat():
     if not model_entry:
         return Response(f"Model '{model_key}' không hợp lệ", status=400)
 
-    llm = model_entry["model"]
+    # model_entry đã là object model trực tiếp, không cần ["model"]
+    llm = model_entry
     user_id = session["user"]["id"]
 
     # --- Sinh embedding cho câu hỏi ---
