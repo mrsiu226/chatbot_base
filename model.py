@@ -183,7 +183,7 @@ else:
 
 # Grok models (secondary)
 if grok_api_key:
-    grok_chat = ModelWrapper(
+    grok_chat_2 = ModelWrapper(
         ChatOpenAI(
             model="grok-2-latest",
             temperature=0.7,
@@ -192,6 +192,28 @@ if grok_api_key:
             timeout=30,
         ),
         "Grok 2"
+    )
+
+    grok_chat_3 = ModelWrapper(
+        ChatOpenAI(
+            model="grok-3-latest",
+            temperature=0.7,
+            api_key=grok_api_key,
+            base_url="https://api.x.ai/v1",
+            timeout=30,
+        ),
+        "Grok 3"
+    )
+
+    grok_chat_4 = ModelWrapper(
+        ChatOpenAI(
+            model="grok-4-latest",
+            temperature=0.7,
+            api_key=grok_api_key,
+            base_url="https://api.x.ai/v1",
+            timeout=30,
+        ),
+        "Grok 4"
     )
 else:
     class DummyModel:
@@ -221,7 +243,9 @@ else:
 
 # Dictionary để chọn model theo tên
 models = {
-    "grok-2": grok_chat,
+    "grok-2": grok_chat_2,
+    "grok-3": grok_chat_3,
+    "grok-4": grok_chat_4,
     "deepseek-chat": deepseek_chat,
     "deepseek-reasoner": deepseek_reasoner,
     "gemini-flash": gemini_flash,
@@ -238,7 +262,7 @@ if __name__ == "__main__":
 
     try:
         print("\n--- Test Gemini Flash ---")
-        res = models["gemini-flash"]["model"].invoke("Xin chào, bạn có hoạt động không?")
+        res = models["grok-3"]["model"].invoke("Xin chào, bạn có hoạt động không?")
         print("Kết quả:", res.content if hasattr(res, "content") else res)
     except Exception as e:
         print("❌ Lỗi khi gọi gemini-flash:", e)
