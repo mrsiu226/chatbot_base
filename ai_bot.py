@@ -82,6 +82,7 @@ def build_prompt(user_msg, short_term_context, long_term_context):
 - Dùng short-term context để giữ mạch hội thoại.
 - Dùng long-term context để bổ sung kiến thức nền.
 - Nếu có mâu thuẫn, ưu tiên short-term context.
+Hãy trả lời theo phong cách của người dùng.
 """
     context_prompt = f"""
 [Long-term context]
@@ -146,6 +147,46 @@ def chat():
             yield f"\n[ERROR]: {str(e)}"
 
     return Response(generate(), mimetype="text/plain")
+
+#========= API ==========
+API_KEY = os.getenv("CHATBOT_API_KEY")
+
+@app.route("/v1/chat", methods=["POST"])
+def chat_api():
+    # --- Xác thực API Key ---
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    token = auth_header.split(" ")[1]
+    if token != API_KEY:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    # --- Lấy input ---
+    data = request.json or {}
+    user_msg = data.get("message", "").strip()
+    model_key = data.get("model", "gemini-flash-lite")
+
+    if not user_msg:
+        return jsonify({"error": "Message không được để trống"}), 400
+
+    llm = models.get(model_key)
+    query_vector = embedder.embed(user_msg).tolist()
+    long_term_context = match_embeddings(query_vector, top_k=5)
+    prompt = build_prompt(user_msg, None, long_term_context)
+
+    # --- Hàm stream phản hồi ---
+    def generate():
+        try:
+            for chunk in llm.stream(prompt):
+                content = getattr(chunk, "content", "")
+                if content:
+                    yield f"data: {json.dumps({'content': content}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+
+    return Response(generate(), mimetype="text/event-stream")
 
 # ========== MAIN ==========
 if __name__ == "__main__":
