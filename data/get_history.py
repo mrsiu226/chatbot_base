@@ -1,4 +1,6 @@
 from supabase import create_client
+# from psycopg2.extras import RealDictCursor
+# import psycopg2
 import os
 from dotenv import load_dotenv
 from data.embed_messages import embedder
@@ -11,6 +13,10 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# POSTGRES_URL = os.getenv("DATABASE_URL")
+# def get_postgres_conn():
+#     return psycopg2.connect(POSTGRES_URL, cursor_factory=RealDictCursor)
 
 def get_latest_messages(user_id, limit=10): #RAG - prompt cho chatbot
     """
