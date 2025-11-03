@@ -1,4 +1,4 @@
-from flask import Flask, request, Response, stream_with_context, redirect, session, jsonify
+from flask import Flask, request, Response, stream_with_context, redirect, session, jsonify, Blueprint
 from dotenv import load_dotenv
 from model import models
 from data.import_data import insert_message
@@ -6,7 +6,10 @@ from data.get_history import get_latest_messages, get_all_messages
 from data.embed_messages import embedder
 from supabase import create_client
 from utils.jwt_helper import jwt_required
-import os, json
+import os, json, requests, sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from utils.jwt_helper import generate_jwt_token
 
 # ---------------- CONFIG ----------------
 load_dotenv()
@@ -149,41 +152,96 @@ def chat():
 
     return Response(generate(), mimetype="text/plain")
 
+# VERIFY TOKEN TỪ WHOISME.AI 
+WHOISME_API_URL = "https://api.whoisme.ai/api/auth/verify-token"
+
+verify_bp = Blueprint("verify", __name__)
+
+@verify_bp.route("/api/verify-whoisme", methods=["POST"])
+def verify_whoisme_token():
+    """Xác thực token từ WhoIsMe, lưu user vào DB, và trả về JWT token của hệ thống"""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid Authorization header"}), 401
+
+    token = auth_header.split(" ")[1]
+
+    try:
+        res = requests.get(WHOISME_API_URL, headers={"Authorization": f"Bearer {token}"})
+        if res.status_code != 200:
+            return jsonify({"valid": False, "error": "Invalid token"}), 401
+
+        data = res.json()
+        if isinstance(data, list) and len(data) > 0:
+            data = data[0]
+
+        user = data.get("user", {})
+        user_id = user.get("userId")
+        email = user.get("email")
+
+        if not user_id or not email:
+            return jsonify({"error": "Thiếu thông tin user"}), 400
+
+        existing = supabase.table("users_aibot").select("id").eq("id", user_id).execute()
+        if not existing.data:
+            supabase.table("users_aibot").insert({
+                "id": user_id,
+                "email": email,
+                "password_hash": "whoisme",  # No password for WhoIsMe users   
+                "source": "whoisme.ai"
+            }).execute()
+
+        jwt_token = generate_jwt_token(user_id, email)
+
+        return jsonify({
+            "success": True,
+            "message": "Xác thực thành công",
+            "user": {
+                "id": user_id,
+                "email": email
+            },
+            "access_token": jwt_token,
+            "token_type": "bearer"
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 #========= API ==========
 API_KEY = os.getenv("CHATBOT_API_KEY")
 
 @app.route("/v1/chat", methods=["POST"])
 @jwt_required
 def chat_api():
-    # --- Lấy thông tin user từ JWT token ---
     current_user = request.current_user
     user_id = current_user["user_id"]
-
-    # --- Lấy input ---
     data = request.json or {}
     user_msg = data.get("message", "").strip()
     model_key = data.get("model", "gemini-flash-lite")
 
     if not user_msg:
-        return jsonify({"error": "Message không được để trống"}), 400
+        return Response("Message không được để trống", status=400)
 
-    # --- Lấy model từ danh sách ---
-    model_entry = models.get(model_key)
-    if not model_entry:
-        return jsonify({"error": f"Model '{model_key}' không hợp lệ"}), 400
+    llm = models.get(model_key)
+    if not llm:
+        return Response(f"Model '{model_key}' không hợp lệ", status=400)
 
-    llm = model_entry
-    
-    # --- Sinh embedding cho câu hỏi ---
+    # --- Short-term context ---
+    short_history = get_latest_messages(user_id, 8)
+    short_term_context = "\n".join([
+        f"User: {h['message']}\nBot: {h['reply']}"
+        for h in reversed(short_history)
+    ])
+
+    # --- Long-term context ---
     query_vector = embedder.embed(user_msg).tolist()
-    
-    # --- Lấy long-term context ---
     long_term_context = match_embeddings(query_vector, top_k=5)
-    
-    # --- Xây prompt hoàn chỉnh ---
-    prompt = build_prompt(user_msg, None, long_term_context)
 
-    # --- Hàm stream phản hồi ---
+    # --- Build prompt ---
+    prompt = build_prompt(user_msg, short_term_context, long_term_context)
+
+    # --- Stream plain text (giống /chat) ---
+    @stream_with_context
     def generate():
         buffer = ""
         try:
@@ -191,15 +249,13 @@ def chat_api():
                 content = getattr(chunk, "content", "")
                 if content:
                     buffer += content
-                    yield f"data: {json.dumps({'content': content}, ensure_ascii=False)}\n\n"
-            
-            # Lưu tin nhắn vào database sau khi stream xong
+                    yield content
+            # Lưu lịch sử chat
             insert_message(user_id, user_msg, buffer)
-            yield "data: [DONE]\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+            yield f"\n[ERROR]: {str(e)}"
 
-    return Response(generate(), mimetype="text/event-stream")
+    return Response(generate(), mimetype="text/plain")
 
 # ========== MAIN ==========
 if __name__ == "__main__":
