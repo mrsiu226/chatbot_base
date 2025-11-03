@@ -5,6 +5,7 @@ from data.import_data import insert_message
 from data.get_history import get_latest_messages, get_all_messages
 from data.embed_messages import embedder
 from supabase import create_client
+from utils.jwt_helper import jwt_required
 import os, json
 
 # ---------------- CONFIG ----------------
@@ -152,15 +153,11 @@ def chat():
 API_KEY = os.getenv("CHATBOT_API_KEY")
 
 @app.route("/v1/chat", methods=["POST"])
+@jwt_required
 def chat_api():
-    # --- Xác thực API Key ---
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return jsonify({"error": "Unauthorized"}), 401
-
-    token = auth_header.split(" ")[1]
-    if token != API_KEY:
-        return jsonify({"error": "Unauthorized"}), 403
+    # --- Lấy thông tin user từ JWT token ---
+    current_user = request.current_user
+    user_id = current_user["user_id"]
 
     # --- Lấy input ---
     data = request.json or {}
@@ -170,18 +167,34 @@ def chat_api():
     if not user_msg:
         return jsonify({"error": "Message không được để trống"}), 400
 
-    llm = models.get(model_key)
+    # --- Lấy model từ danh sách ---
+    model_entry = models.get(model_key)
+    if not model_entry:
+        return jsonify({"error": f"Model '{model_key}' không hợp lệ"}), 400
+
+    llm = model_entry
+    
+    # --- Sinh embedding cho câu hỏi ---
     query_vector = embedder.embed(user_msg).tolist()
+    
+    # --- Lấy long-term context ---
     long_term_context = match_embeddings(query_vector, top_k=5)
+    
+    # --- Xây prompt hoàn chỉnh ---
     prompt = build_prompt(user_msg, None, long_term_context)
 
     # --- Hàm stream phản hồi ---
     def generate():
+        buffer = ""
         try:
             for chunk in llm.stream(prompt):
                 content = getattr(chunk, "content", "")
                 if content:
+                    buffer += content
                     yield f"data: {json.dumps({'content': content}, ensure_ascii=False)}\n\n"
+            
+            # Lưu tin nhắn vào database sau khi stream xong
+            insert_message(user_id, user_msg, buffer)
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
