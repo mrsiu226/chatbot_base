@@ -152,95 +152,67 @@ def chat():
 
     return Response(generate(), mimetype="text/plain")
 
-# VERIFY TOKEN TỪ WHOISME.AI 
+
+
 WHOISME_API_URL = "https://api.whoisme.ai/api/auth/verify-token"
+whoisme_bp = Blueprint("whoisme", __name__)
 
-verify_bp = Blueprint("verify", __name__)
-
-@verify_bp.route("/api/verify-whoisme", methods=["POST"])
-def verify_whoisme_token():
-    """Xác thực token từ WhoIsMe, lưu user vào DB, và trả về JWT token của hệ thống"""
+@whoisme_bp.route("/v1/chat", methods=["POST"])
+def whoisme_chat():
     auth_header = request.headers.get("Authorization", "")
     if not auth_header or not auth_header.startswith("Bearer "):
         return jsonify({"error": "Missing or invalid Authorization header"}), 401
 
-    token = auth_header.split(" ")[1]
+    whoisme_token = auth_header.split(" ")[1]
 
+    # --- Verify token WhoIsMe ---
     try:
-        res = requests.get(WHOISME_API_URL, headers={"Authorization": f"Bearer {token}"})
+        res = requests.get(WHOISME_API_URL, headers={"Authorization": f"Bearer {whoisme_token}"})
         if res.status_code != 200:
-            return jsonify({"valid": False, "error": "Invalid token"}), 401
+            return jsonify({"error": "Invalid WhoIsMe token"}), 401
 
         data = res.json()
         if isinstance(data, list) and len(data) > 0:
             data = data[0]
 
-        user = data.get("user", {})
-        user_id = user.get("userId")
-        email = user.get("email")
-
+        user_info = data.get("user", {})
+        user_id = user_info.get("userId")
+        email = user_info.get("email")
         if not user_id or not email:
             return jsonify({"error": "Thiếu thông tin user"}), 400
 
+        # --- Lưu user vào DB nếu chưa có ---
         existing = supabase.table("users_aibot").select("id").eq("id", user_id).execute()
         if not existing.data:
             supabase.table("users_aibot").insert({
                 "id": user_id,
                 "email": email,
-                "password_hash": "whoisme",  # No password for WhoIsMe users   
+                "password_hash": "whoisme",
                 "source": "whoisme.ai"
             }).execute()
 
-        jwt_token = generate_jwt_token(user_id, email)
-
-        return jsonify({
-            "success": True,
-            "message": "Xác thực thành công",
-            "user": {
-                "id": user_id,
-                "email": email
-            },
-            "access_token": jwt_token,
-            "token_type": "bearer"
-        }), 200
-
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"WhoIsMe token verification failed: {str(e)}"}), 500
 
-#========= API ==========
-API_KEY = os.getenv("CHATBOT_API_KEY")
-
-@app.route("/v1/chat", methods=["POST"])
-@jwt_required
-def chat_api():
-    current_user = request.current_user
-    user_id = current_user["user_id"]
+    # --- Chat logic ---
     data = request.json or {}
     user_msg = data.get("message", "").strip()
     model_key = data.get("model", "gemini-flash-lite")
-
     if not user_msg:
-        return Response("Message không được để trống", status=400)
+        return jsonify({"error": "Message không được để trống"}), 400
 
     llm = models.get(model_key)
     if not llm:
-        return Response(f"Model '{model_key}' không hợp lệ", status=400)
+        return jsonify({"error": "Model không hợp lệ"}), 400
 
-    # --- Short-term context ---
+    # --- Short-term + long-term context ---
     short_history = get_latest_messages(user_id, 8)
-    short_term_context = "\n".join([
-        f"User: {h['message']}\nBot: {h['reply']}"
-        for h in reversed(short_history)
-    ])
-
-    # --- Long-term context ---
+    short_term_context = "\n".join([f"User: {h['message']}\nBot: {h['reply']}" for h in reversed(short_history)])
     query_vector = embedder.embed(user_msg).tolist()
     long_term_context = match_embeddings(query_vector, top_k=5)
-
-    # --- Build prompt ---
     prompt = build_prompt(user_msg, short_term_context, long_term_context)
 
-    # --- Stream plain text (giống /chat) ---
+    # --- Stream response ---
     @stream_with_context
     def generate():
         buffer = ""
@@ -257,6 +229,8 @@ def chat_api():
 
     return Response(generate(), mimetype="text/plain")
 
+# ---------------- REGISTER ----------------
+app.register_blueprint(whoisme_bp)
 # ========== MAIN ==========
 if __name__ == "__main__":
     app.run(debug=True)
