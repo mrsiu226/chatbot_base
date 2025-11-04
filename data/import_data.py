@@ -7,7 +7,6 @@ load_dotenv()
 
 LOCAL_DB_URL = os.getenv("POSTGRES_URL")
 
-# --- Kết nối PostgreSQL local ---
 conn = psycopg2.connect(LOCAL_DB_URL)
 cursor = conn.cursor()
 
@@ -15,15 +14,17 @@ print("✅ Đã kết nối tới PostgreSQL local thành công.")
 
 
 def insert_message(user_id, user_message, bot_reply, session_id=None):
-    """Chèn message mới + embedding vector + session_id vào local PostgreSQL"""
     try:
         embedding = None
         if user_message:
             embedding = embedder.embed(user_message).tolist()
 
-        # Nếu bảng có schema whoisme thì ghi rõ
         cursor.execute("""
-            INSERT INTO whoisme.messages (user_id, message, reply, embedding_vector, session_id)
+            INSERT INTO whoisme.messages (
+                    user_id, message, 
+                    reply, 
+                    embedding_vector,
+                    session_id)
             VALUES (%s, %s, %s, %s, %s)
         """, (user_id, user_message, bot_reply, str(embedding), session_id))
 
@@ -38,14 +39,13 @@ def insert_message(user_id, user_message, bot_reply, session_id=None):
 def insert_user(email: str, password_hash: str):
     """Chèn user mới vào bảng users, nếu email đã tồn tại thì bỏ qua"""
     try:
-        # Kiểm tra user đã tồn tại chưa
         cursor.execute("""
             SELECT id FROM whoisme.users WHERE email = %s
         """, (email,))
         existing = cursor.fetchone()
 
         if existing:
-            print(f"⚠️ User {email} đã tồn tại, bỏ qua.")
+            print(f"User {email} đã tồn tại, bỏ qua.")
             return
 
         cursor.execute("""
@@ -53,10 +53,10 @@ def insert_user(email: str, password_hash: str):
             VALUES (%s, %s)
         """, (email, password_hash))
         conn.commit()
-        print(f"👤 User {email} đã được tạo thành công!")
+        print(f"User {email} đã được tạo thành công!")
 
     except Exception as e:
-        print("❌ Lỗi khi chèn user:", e)
+        print("Lỗi khi chèn user:", e)
         conn.rollback()
 
 
