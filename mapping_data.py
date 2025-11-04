@@ -79,11 +79,11 @@ for w in whoisme:
         continue
 
     local_cursor.execute("""
-        INSERT INTO whoisme.embeddings (id, name, embedding, text, column_name, row_index, data_hash, updated_at, level)
+        INSERT INTO whoisme.embeddings (id, sheet_name, embedding, text, column_name, row_index, data_hash, updated_at, level)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (id) DO NOTHING;
     """, (
-        w["id"], w.get("name"), str(w.get("embedding")),
+        w["id"], w.get("sheet_name"), str(w.get("embedding")),
         w.get("text"), w.get("column_name"), w.get("row_index"),
         w.get("data_hash"), w.get("updated_at"), w.get("level")
     ))

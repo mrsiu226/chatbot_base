@@ -18,7 +18,6 @@ load_dotenv()
 LOCAL_DB_URL = os.getenv("POSTGRES_URL")
 
 def get_conn():
-    """Tạo connection PostgreSQL"""
     return psycopg2.connect(LOCAL_DB_URL, cursor_factory=RealDictCursor)
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = "super-secret-key"
@@ -69,7 +68,7 @@ def match_embeddings(query_vector, top_k=5):
         sql = """
         SELECT text, sheet_name, column_name,
                 1 - (embedding <=> %s::vector) AS similarity
-        FROM embeddings
+        FROM "whoisme"."embeddings"
         ORDER BY embedding <=> %s::vector
         LIMIT %s;
         """
@@ -175,12 +174,16 @@ def whoisme_chat():
 
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT id FROM users_aibot WHERE id = %s;", (user_id,))
+        cur.execute("SELECT id FROM whoisme.users WHERE id = %s;", (str(user_id),))
         exists = cur.fetchone()
         if not exists:
             cur.execute(
-                "INSERT INTO users_aibot (id, email, password_hash, source) VALUES (%s, %s, %s, %s)",
-                (user_id, email, "whoisme", "whoisme.ai")
+                """
+                INSERT INTO whoisme.users (id, email, password_hash, source)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (email) DO NOTHING;
+                """,
+                (str(user_id), email, "whoisme", "whoisme.ai")
             )
             conn.commit()
         cur.close()
@@ -223,6 +226,44 @@ def whoisme_chat():
     return Response(generate(), mimetype="text/plain")
 
 
+#=======GET HISTORY API FOR WHOISME =======
+@whoisme_bp.route("/v1/history", methods=["POST"])
+def whoisme_history():
+    """Trả về lịch sử chat của user theo session_id (bắt buộc)."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid Authorization header"}), 401
+
+    whoisme_token = auth_header.split(" ")[1]
+
+    try:
+        res = requests.get(WHOISME_API_URL, headers={"Authorization": f"Bearer {whoisme_token}"})
+        if res.status_code != 200:
+            return jsonify({"error": "Invalid WhoIsMe token"}), 401
+
+        data = res.json()
+        user_info = data[0]["user"] if isinstance(data, list) else data.get("user", {})
+        user_id = user_info.get("userId")
+        if not user_id:
+            return jsonify({"error": "Thiếu userId trong token"}), 400
+
+        # --- Lấy session_id bắt buộc ---
+        session_id = request.args.get("session_id") or request.json.get("session_id") if request.is_json else None
+        if not session_id:
+            return jsonify({"error": "Thiếu session_id"}), 400
+
+        # --- Lọc tin nhắn theo session_id ---
+        history = get_all_messages(user_id, session_id=session_id)
+        return jsonify({
+            "user_id": user_id,
+            "session_id": session_id,
+            "messages": history
+        })
+
+    except Exception as e:
+        print(f"Lỗi khi lấy lịch sử: {e}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+    
 app.register_blueprint(whoisme_bp)
 
 # ========== MAIN ==========
