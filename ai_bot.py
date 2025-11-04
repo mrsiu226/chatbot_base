@@ -4,19 +4,22 @@ from model import models
 from data.import_data import insert_message
 from data.get_history import get_latest_messages, get_all_messages
 from data.embed_messages import embedder
-from supabase import create_client
 from utils.jwt_helper import jwt_required
-import os, json, requests, sys
+import os, json, requests, sys, psycopg2
+from psycopg2.extras import RealDictCursor
+
+
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from utils.jwt_helper import generate_jwt_token
 
 # ---------------- CONFIG ----------------
 load_dotenv()
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+LOCAL_DB_URL = os.getenv("POSTGRES_URL")
 
+def get_conn():
+    """Tạo connection PostgreSQL"""
+    return psycopg2.connect(LOCAL_DB_URL, cursor_factory=RealDictCursor)
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = "super-secret-key"
 
@@ -59,29 +62,37 @@ def history():
 # ========== HELPER FUNCTIONS ==========
 
 def match_embeddings(query_vector, top_k=5):
-    """Gọi RPC match_embeddings trong Supabase để tìm các đoạn văn gần nhất."""
+    """Truy vấn tương tự như Supabase RPC match_embeddings"""
     try:
-        response = supabase.rpc("match_embeddings", {
-            "query_embedding": query_vector,
-            "match_count": top_k
-        }).execute()
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        sql = """
+        SELECT text, sheet_name, column_name,
+                1 - (embedding <=> %s::vector) AS similarity
+        FROM embeddings
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s;
+        """
+        cur.execute(sql, (query_vector, query_vector, top_k))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
 
-        results = response.data or []
-        if not results:
+        if not rows:
             return "Không tìm thấy ngữ cảnh liên quan."
 
         context_text = "\n".join([
             f"- {r['text']} (sheet: {r['sheet_name']}, col: {r['column_name']})"
-            for r in results
+            for r in rows
         ])
         return context_text
 
     except Exception as e:
-        print(f"Lỗi khi gọi match_embeddings: {e}")
+        print(f"Lỗi khi truy vấn embeddings: {e}")
         return "Không thể truy xuất ngữ cảnh."
 
+
 def build_prompt(user_msg, short_term_context, long_term_context):
-    """Ghép prompt với short-term + long-term context."""
     system_prompt = """Bạn là chatbot tư vấn cá nhân hóa.
 - Dùng short-term context để giữ mạch hội thoại.
 - Dùng long-term context để bổ sung kiến thức nền.
@@ -106,37 +117,27 @@ def chat():
 
     data = request.json or {}
     user_msg = data.get("message", "").strip()
-    model_key = data.get("model", "gemini-flash-lite")  # Default: nhanh nhất
+    model_key = data.get("model", "gemini-flash-lite")
 
     if not user_msg:
         return Response("Message không được để trống", status=400)
 
-    # --- Lấy model từ danh sách ---
-    model_entry = models.get(model_key)
-    if not model_entry:
+    llm = models.get(model_key)
+    if not llm:
         return Response(f"Model '{model_key}' không hợp lệ", status=400)
 
-    # model_entry đã là object model trực tiếp, không cần ["model"]
-    llm = model_entry
     user_id = session["user"]["id"]
 
-    # --- Sinh embedding cho câu hỏi ---
     query_vector = embedder.embed(user_msg).tolist()
-
-    # --- Lấy short-term context ---
     short_history = get_latest_messages(user_id, 8)
     short_term_context = "\n".join([
         f"User: {h['message']}\nBot: {h['reply']}"
         for h in reversed(short_history)
     ])
 
-    # --- Lấy long-term context ---
     long_term_context = match_embeddings(query_vector, top_k=5)
-
-    # --- Xây prompt hoàn chỉnh ---
     prompt = build_prompt(user_msg, short_term_context, long_term_context)
 
-    # --- Stream phản hồi ---
     @stream_with_context
     def generate():
         buffer = ""
@@ -152,8 +153,7 @@ def chat():
 
     return Response(generate(), mimetype="text/plain")
 
-
-
+# ---------------- VERIFY WHOISME TOKEN + CHAT ----------------
 WHOISME_API_URL = "https://api.whoisme.ai/api/auth/verify-token"
 whoisme_bp = Blueprint("whoisme", __name__)
 
@@ -164,42 +164,35 @@ def whoisme_chat():
         return jsonify({"error": "Missing or invalid Authorization header"}), 401
 
     whoisme_token = auth_header.split(" ")[1]
-
-    # --- Verify token WhoIsMe ---
     try:
         res = requests.get(WHOISME_API_URL, headers={"Authorization": f"Bearer {whoisme_token}"})
         if res.status_code != 200:
             return jsonify({"error": "Invalid WhoIsMe token"}), 401
-
         data = res.json()
-        if isinstance(data, list) and len(data) > 0:
-            data = data[0]
-
-        user_info = data.get("user", {})
+        user_info = data[0]["user"] if isinstance(data, list) else data.get("user", {})
         user_id = user_info.get("userId")
         email = user_info.get("email")
 
-        if not user_id or not email:
-            return jsonify({"error": "Thiếu thông tin user"}), 400
-
-        # --- Lưu user nếu chưa có ---
-        existing = supabase.table("users_aibot").select("id").eq("id", user_id).execute()
-        if not existing.data:
-            supabase.table("users_aibot").insert({
-                "id": user_id,
-                "email": email,
-                "password_hash": "whoisme",
-                "source": "whoisme.ai"
-            }).execute()
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users_aibot WHERE id = %s;", (user_id,))
+        exists = cur.fetchone()
+        if not exists:
+            cur.execute(
+                "INSERT INTO users_aibot (id, email, password_hash, source) VALUES (%s, %s, %s, %s)",
+                (user_id, email, "whoisme", "whoisme.ai")
+            )
+            conn.commit()
+        cur.close()
+        conn.close()
 
     except Exception as e:
         return jsonify({"error": f"WhoIsMe token verification failed: {str(e)}"}), 500
 
-    # --- Chat logic ---
     payload = request.json or {}
     user_msg = payload.get("message", "").strip()
     session_id = payload.get("session_id", None)
-    model_key = payload.get("model", "gemini-flash-lite")  
+    model_key = payload.get("model", "gemini-flash-lite")
 
     if not user_msg:
         return jsonify({"error": "Message không được để trống"}), 400
@@ -208,16 +201,12 @@ def whoisme_chat():
     if not llm:
         return jsonify({"error": "Model không hợp lệ"}), 400
 
-    # --- Short-term + long-term context ---
-    short_history = get_latest_messages(user_id, session_id=session_id, limit=8)  
+    short_history = get_latest_messages(user_id, session_id=session_id, limit=8)
     short_term_context = "\n".join([f"User: {h['message']}\nBot: {h['reply']}" for h in reversed(short_history)])
-
     query_vector = embedder.embed(user_msg).tolist()
     long_term_context = match_embeddings(query_vector, top_k=5)
-
     prompt = build_prompt(user_msg, short_term_context, long_term_context)
 
-    # --- Stream response ---
     @stream_with_context
     def generate():
         buffer = ""
@@ -234,8 +223,8 @@ def whoisme_chat():
     return Response(generate(), mimetype="text/plain")
 
 
-# ---------------- REGISTER ----------------
 app.register_blueprint(whoisme_bp)
+
 # ========== MAIN ==========
 if __name__ == "__main__":
     app.run(debug=True)

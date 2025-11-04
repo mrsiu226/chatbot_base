@@ -1,47 +1,67 @@
 from flask import Blueprint, request, jsonify
 from flask_bcrypt import Bcrypt
-from supabase import create_client
-import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
+import os
 
+# ================== Cấu hình ==================
 load_dotenv()
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 bcrypt = Bcrypt()
 register_bp = Blueprint("register_bp", __name__)
 
+LOCAL_DB_URL = os.getenv("POSTGRES_URL")
+
+def get_connection():
+    """Tạo kết nối PostgreSQL local"""
+    return psycopg2.connect(LOCAL_DB_URL, cursor_factory=RealDictCursor)
+
+
+# ================== API REGISTER ==================
 @register_bp.route("/register", methods=["POST"])
 def register():
-    data = request.json
+    data = request.json or {}
     email = data.get("email")
     password = data.get("password")
 
     if not email or not password:
         return jsonify({"error": "Thiếu email hoặc mật khẩu"}), 400
 
-    # Kiểm tra email đã tồn tại chưa
-    existing_user = supabase.table("users_aibot").select("id").eq("email", email).execute()
-    if existing_user.data:
-        return jsonify({"error": "Email đã được đăng ký"}), 400
-
-    # Hash mật khẩu
-    pw_hash = bcrypt.generate_password_hash(password).decode("utf-8")
-
-    # Lưu vào Supabase, dùng try/except để bắt lỗi
     try:
-        res = supabase.table("users_aibot").insert({
-            "email": email,
-            "password_hash": pw_hash
-        }).execute()
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        conn = get_connection()
+        cur = conn.cursor()
 
-    # Thành công
-    return jsonify({
-        "success": True,
-        "message": "Đăng ký thành công",
-        "redirect": "/login-ui"
-    }), 200
+        # Kiểm tra xem email đã tồn tại chưa
+        cur.execute("SELECT id FROM whoisme.users WHERE email = %s LIMIT 1;", (email,))
+        existing_user = cur.fetchone()
+        if existing_user:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Email đã được đăng ký"}), 400
+
+        # Hash mật khẩu
+        pw_hash = bcrypt.generate_password_hash(password).decode("utf-8")
+
+        # Chèn user mới
+        cur.execute("""
+            INSERT INTO whoisme.users (email, password_hash, source)
+            VALUES (%s, %s, %s)
+            RETURNING id;
+        """, (email, pw_hash, "local"))
+
+        new_user = cur.fetchone()
+        conn.commit()
+
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            "success": True,
+            "message": "Đăng ký thành công",
+            "user_id": new_user["id"],
+            "redirect": "/login-ui"
+        }), 200
+
+    except Exception as e:
+        print("❌ Lỗi khi đăng ký:", e)
+        return jsonify({"error": "Lỗi hệ thống hoặc cơ sở dữ liệu"}), 500

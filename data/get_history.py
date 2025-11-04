@@ -1,4 +1,4 @@
-from supabase import create_client
+import psycopg2
 import os
 from dotenv import load_dotenv
 from data.embed_messages import embedder
@@ -7,28 +7,44 @@ import ast
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+LOCAL_DB_URL = os.getenv("POSTGRES_URL")
 
-# Lấy tin nhắn theo session_id
+# --- Kết nối PostgreSQL local ---
+local_conn = psycopg2.connect(LOCAL_DB_URL)
+local_conn.autocommit = True
+
+
 def get_latest_messages(user_id, session_id=None, limit=10):
     """
     Lấy `limit` tin nhắn gần nhất của user, có thể lọc theo session_id.
     """
     try:
-        query = (
-            supabase.table("messages_test")
-            .select("*")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(limit)
-        )
-        if session_id:
-            query = query.eq("session_id", session_id)
-
-        response = query.execute()
-        return response.data if hasattr(response, "data") else []
+        with local_conn.cursor() as cur:
+            if session_id:
+                cur.execute(
+                    """
+                    SELECT id, message, reply, created_at, session_id
+                    FROM whoisme.messages
+                    WHERE user_id = %s AND session_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s;
+                    """,
+                    (user_id, session_id, limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, message, reply, created_at, session_id
+                    FROM whoisme.messages
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s;
+                    """,
+                    (user_id, limit),
+                )
+            rows = cur.fetchall()
+            colnames = [desc[0] for desc in cur.description]
+            return [dict(zip(colnames, r)) for r in rows]
     except Exception as e:
         print("❌ Lỗi khi lấy lịch sử chat:", e)
         return []
@@ -39,23 +55,36 @@ def get_all_messages(user_id, session_id=None):
     Lấy toàn bộ tin nhắn của user, có thể lọc theo session_id.
     """
     try:
-        query = (
-            supabase.table("messages_test")
-            .select("message, reply, created_at")
-            .eq("user_id", user_id)
-            .order("id", desc=False)
-        )
-        if session_id:
-            query = query.eq("session_id", session_id)
-
-        response = query.execute()
-        return response.data if hasattr(response, "data") else []
+        with local_conn.cursor() as cur:
+            if session_id:
+                cur.execute(
+                    """
+                    SELECT message, reply, created_at
+                    FROM whoisme.messages
+                    WHERE user_id = %s AND session_id = %s
+                    ORDER BY id ASC;
+                    """,
+                    (user_id, session_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT message, reply, created_at
+                    FROM whoisme.messages
+                    WHERE user_id = %s
+                    ORDER BY id ASC;
+                    """,
+                    (user_id,),
+                )
+            rows = cur.fetchall()
+            colnames = [desc[0] for desc in cur.description]
+            return [dict(zip(colnames, r)) for r in rows]
     except Exception as e:
         print("❌ Lỗi khi lấy tất cả tin nhắn:", e)
         return []
 
 
-# Convert + embedding context
+# --- Convert raw embedding text thành numpy array ---
 def to_float_array(raw):
     if raw is None:
         return None
@@ -73,20 +102,20 @@ def to_float_array(raw):
             return np.asarray(out, dtype=float)
     if isinstance(raw, str):
         s = raw.strip()
-        if s.startswith('[') and s.endswith(']'):
+        if s.startswith("[") and s.endswith("]"):
             try:
                 parsed = ast.literal_eval(s)
                 return np.asarray([float(x) for x in parsed], dtype=float)
             except Exception:
                 pass
-        if s.startswith('{') and s.endswith('}'):
+        if s.startswith("{") and s.endswith("}"):
             inner = s[1:-1]
-            parts = [p.strip().strip('"').strip("'") for p in inner.split(',') if p.strip()]
+            parts = [p.strip().strip('"').strip("'") for p in inner.split(",") if p.strip()]
             try:
                 return np.asarray([float(p) for p in parts], dtype=float)
             except Exception:
                 return None
-        parts = [p.strip().strip('"').strip("'") for p in s.split(',') if p.strip()]
+        parts = [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
         try:
             return np.asarray([float(p) for p in parts], dtype=float)
         except Exception:
@@ -96,24 +125,41 @@ def to_float_array(raw):
 
 def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int = 5, debug: bool = False):
     """
-    Lấy long-term context theo user_id (và session_id nếu có).
+    Lấy long-term context từ bảng whoisme.messages local PostgreSQL.
     """
     q_vec = embedder.embed(query)
     q_vec = to_float_array(q_vec)
     if q_vec is None:
         raise ValueError("Không thể tạo vector cho query")
 
-    query_builder = (
-        supabase.table("messages_test")
-        .select("id, message, reply, embedding_vector")
-        .eq("user_id", user_id)
-        .not_.is_("embedding_vector", None)
-    )
-    if session_id:
-        query_builder = query_builder.eq("session_id", session_id)
+    try:
+        with local_conn.cursor() as cur:
+            if session_id:
+                cur.execute(
+                    """
+                    SELECT id, message, reply, embedding_vector
+                    FROM whoisme.messages
+                    WHERE user_id = %s AND session_id = %s AND embedding_vector IS NOT NULL;
+                    """,
+                    (user_id, session_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, message, reply, embedding_vector
+                    FROM whoisme.messages
+                    WHERE user_id = %s AND embedding_vector IS NOT NULL;
+                    """,
+                    (user_id,),
+                )
 
-    resp = query_builder.execute()
-    rows = resp.data or []
+            rows = cur.fetchall()
+            colnames = [desc[0] for desc in cur.description]
+            rows = [dict(zip(colnames, r)) for r in rows]
+    except Exception as e:
+        print("❌ Lỗi khi truy vấn PostgreSQL:", e)
+        return ""
+
     if not rows:
         return ""
 
@@ -135,10 +181,14 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
     for sim, row in sims:
         long_context_text += f"User: {row.get('message')}\nBot: {row.get('reply')}\n"
 
+    if debug:
+        for sim, row in sims:
+            print(f"🔹 {row.get('id')} → sim={sim:.3f}")
+
     return long_context_text
 
 
-# Test
+# --- Test ---
 if __name__ == "__main__":
     uid = "d3f893c7-2751-40f3-9bb4-b201ac8987a0"
     sess = "session_abc123"
