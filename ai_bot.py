@@ -178,10 +178,11 @@ def whoisme_chat():
         user_info = data.get("user", {})
         user_id = user_info.get("userId")
         email = user_info.get("email")
+
         if not user_id or not email:
             return jsonify({"error": "Thiếu thông tin user"}), 400
 
-        # --- Lưu user vào DB nếu chưa có ---
+        # --- Lưu user nếu chưa có ---
         existing = supabase.table("users_aibot").select("id").eq("id", user_id).execute()
         if not existing.data:
             supabase.table("users_aibot").insert({
@@ -195,9 +196,11 @@ def whoisme_chat():
         return jsonify({"error": f"WhoIsMe token verification failed: {str(e)}"}), 500
 
     # --- Chat logic ---
-    data = request.json or {}
-    user_msg = data.get("message", "").strip()
-    model_key = data.get("model", "gemini-flash-lite")
+    payload = request.json or {}
+    user_msg = payload.get("message", "").strip()
+    session_id = payload.get("session_id", None)
+    model_key = payload.get("model", "gemini-flash-lite")  
+
     if not user_msg:
         return jsonify({"error": "Message không được để trống"}), 400
 
@@ -206,10 +209,12 @@ def whoisme_chat():
         return jsonify({"error": "Model không hợp lệ"}), 400
 
     # --- Short-term + long-term context ---
-    short_history = get_latest_messages(user_id, 8)
+    short_history = get_latest_messages(user_id, session_id=session_id, limit=8)  
     short_term_context = "\n".join([f"User: {h['message']}\nBot: {h['reply']}" for h in reversed(short_history)])
+
     query_vector = embedder.embed(user_msg).tolist()
     long_term_context = match_embeddings(query_vector, top_k=5)
+
     prompt = build_prompt(user_msg, short_term_context, long_term_context)
 
     # --- Stream response ---
@@ -222,12 +227,12 @@ def whoisme_chat():
                 if content:
                     buffer += content
                     yield content
-            # Lưu lịch sử chat
-            insert_message(user_id, user_msg, buffer)
+            insert_message(user_id, user_msg, buffer, session_id=session_id)
         except Exception as e:
             yield f"\n[ERROR]: {str(e)}"
 
     return Response(generate(), mimetype="text/plain")
+
 
 # ---------------- REGISTER ----------------
 app.register_blueprint(whoisme_bp)
