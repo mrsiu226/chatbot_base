@@ -174,12 +174,16 @@ def whoisme_chat():
 
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT id FROM users_aibot WHERE id = %s;", (user_id,))
+        cur.execute("SELECT id FROM whoisme.users WHERE id = %s;", (str(user_id),))
         exists = cur.fetchone()
         if not exists:
             cur.execute(
-                "INSERT INTO users_aibot (id, email, password_hash, source) VALUES (%s, %s, %s, %s)",
-                (user_id, email, "whoisme", "whoisme.ai")
+                """
+                INSERT INTO whoisme.users (id, email, password_hash, source)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (email) DO NOTHING;
+                """,
+                (str(user_id), email, "whoisme", "whoisme.ai")
             )
             conn.commit()
         cur.close()
