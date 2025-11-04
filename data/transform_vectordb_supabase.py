@@ -1,4 +1,4 @@
-from supabase import create_client
+import psycopg2
 from dotenv import load_dotenv
 from tqdm import tqdm
 import os
@@ -6,15 +6,22 @@ import pickle
 from datetime import datetime
 
 load_dotenv()
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-TABLE_NAME = "embeddings"
+
 EMB_DIR = "data/embeddings"
+LOCAL_DB_URL = os.getenv("POSTGRES_URL")
+TABLE_NAME = "whoisme.embeddings"
+
+# --- Kết nối PostgreSQL local ---
+conn = psycopg2.connect(LOCAL_DB_URL)
+cursor = conn.cursor()
+print("Đã kết nối tới PostgreSQL local thành công.")
+
 
 def load_vector_files():
     return [f for f in os.listdir(EMB_DIR) if f.endswith(".pkl")]
 
-def upload_embeddings(supabase):
+
+def upload_embeddings():
     files = load_vector_files()
     if not files:
         print("Không có file embedding nào trong thư mục data/embeddings.")
@@ -40,7 +47,11 @@ def upload_embeddings(supabase):
                 embs = col_data.get("embeddings", [])
             else:
                 embs = col_data
-                texts = df[col_name].astype(str).tolist() if df is not None and col_name in df.columns else []
+                texts = (
+                    df[col_name].astype(str).tolist()
+                    if df is not None and col_name in df.columns
+                    else []
+                )
 
             if len(texts) != len(embs):
                 print(f"Số lượng text và embedding không khớp trong cột {col_name}")
@@ -56,39 +67,51 @@ def upload_embeddings(supabase):
                     metadata = df.iloc[idx].to_dict()
                     level = metadata.get("Mức")
 
-                row = {
-                    "sheet_name": sheet_name,
-                    "column_name": col_name,
-                    "row_index": idx,
-                    "text": text,
-                    "embedding": emb,
-                    "data_hash": data_hash,
-                    "updated_at": updated_at,
-                    "level": level, 
-                }
-
+                row = (
+                    sheet_name,
+                    col_name,
+                    idx,
+                    text,
+                    str(emb),  
+                    data_hash,
+                    updated_at,
+                    level,
+                )
                 rows.append(row)
 
-        print(f"\nUpload {len(rows)} embeddings từ {file} ({len(embeddings_by_col)} cột)...")
+        print(f"\n📦 Upload {len(rows)} embeddings từ {file} ({len(embeddings_by_col)} cột)...")
 
         if not rows:
-            print("File không có dữ liệu hợp lệ, bỏ qua.")
+            print("⚠️ File không có dữ liệu hợp lệ, bỏ qua.")
             continue
 
         # Upload theo batch 500 bản ghi/lần
         batch_size = 500
         for i in tqdm(range(0, len(rows), batch_size), desc=f"{sheet_name}"):
             chunk = rows[i:i + batch_size]
-            supabase.table(TABLE_NAME).insert(chunk).execute()
+            try:
+                args_str = b",".join(
+                    cursor.mogrify("(%s,%s,%s,%s,%s,%s,%s,%s)", row) for row in chunk
+                )
+                cursor.execute(
+                    b"INSERT INTO " + TABLE_NAME.encode() +
+                    b" (sheet_name, column_name, row_index, text, embedding, data_hash, updated_at, level) VALUES " +
+                    args_str
+                )
+                conn.commit()
+            except Exception as e:
+                print("❌ Lỗi khi upload batch:", e)
+                conn.rollback()
 
-        print(f"Hoàn tất upload {file} ({len(rows)} bản ghi)\n")
+        print(f"✅ Hoàn tất upload {file} ({len(rows)} bản ghi)\n")
 
 
 def main():
-    print("Kết nối Supabase...")
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("Kết nối thành công!\n")
-    upload_embeddings(supabase)
+    print("🚀 Bắt đầu upload embeddings lên PostgreSQL local...")
+    upload_embeddings()
+    cursor.close()
+    conn.close()
+    print("🏁 Hoàn tất toàn bộ quá trình upload!")
 
 
 if __name__ == "__main__":

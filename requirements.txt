@@ -27,3 +27,4 @@ google-auth
 google-auth-oauthlib
 google-generativeai
 PyJWT
+psycopg2-binary
