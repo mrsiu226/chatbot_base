@@ -4,7 +4,6 @@ langchain
 langchain-community
 langchain-openai
 langchain-text-splitters
-langchain-google-genai
 openai
 pydantic
 python-dotenv
@@ -12,8 +11,6 @@ requests
 faiss-cpu
 supabase
 dotenv
-fastmcp
-mcp
 aiohttp
 flask-bcrypt
 scikit-learn

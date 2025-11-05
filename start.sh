@@ -3,9 +3,16 @@
 # Chatbot application startup script
 # Usage: ./start.sh [start|stop|restart|status]
 
-APPDIR="/home/chatbotD8ZL/chatbot.toila.ai.vn/chatbot_base"
-PIDFILE="/home/chatbotD8ZL/chatbot.toila.ai.vn/logs/gunicorn.pid"
-LOGDIR="/home/chatbotD8ZL/chatbot.toila.ai.vn/logs"
+# Load PROJECT_ROOT from .env safely
+if [ -f ".env" ]; then
+    PROJECT_ROOT=$(grep "^PROJECT_ROOT=" .env | cut -d '=' -f2 | tr -d '"')
+fi
+
+# Use PROJECT_ROOT from env or default
+PROJECT_ROOT=${PROJECT_ROOT:-"/home/chatbotySia/chatbot.whoisme.ai"}
+APPDIR="${PROJECT_ROOT}/chatbot_base"
+PIDFILE="${PROJECT_ROOT}/logs/gunicorn.pid"
+LOGDIR="${PROJECT_ROOT}/logs"
 USER="root"
 
 cd $APPDIR
