@@ -263,6 +263,53 @@ def whoisme_history():
     except Exception as e:
         print(f"Lỗi khi lấy lịch sử: {e}")
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+#======= HIDDEN HISTORY API FOR WHOISME =======
+@whoisme_bp.route("/v1/hidden", methods=["POST"])
+def whoisme_hidden_history():
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid Authorization header"}), 401
+
+    token = auth_header.split(" ")[1]
+
+    try:
+        verify = requests.get(WHOISME_API_URL, headers={"Authorization": f"Bearer {token}"})
+        if verify.status_code != 200:
+            return jsonify({"error": "Invalid WhoIsMe token"}), 401
+
+        data = verify.json()
+        user_info = data[0]["user"] if isinstance(data, list) else data.get("user", {})
+        user_id = user_info.get("userId")
+        if not user_id:
+            return jsonify({"error": "Thiếu userId trong token"}), 400
+
+        # --- Lấy session_id ---
+        req_data = request.json or {}
+        session_id = req_data.get("session_id")
+        if not session_id:
+            return jsonify({"error": "Thiếu session_id"}), 400
+        
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE whoisme.messages
+                SET is_deleted = TRUE
+                WHERE user_id = %s 
+                    AND session_id = %s;
+            """, (str(user_id), str(session_id)))
+            conn.commit()
+        conn.close()
+
+        return jsonify({
+            "session_id": session_id,
+            "user_id": user_id
+        })
+
+    except Exception as e:
+        print(f"[ERROR] Hidden history failed: {e}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
     
 app.register_blueprint(whoisme_bp)
 

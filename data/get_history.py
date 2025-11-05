@@ -23,7 +23,9 @@ def get_latest_messages(user_id, session_id=None, limit=10):
                     """
                     SELECT id, message, reply, created_at, session_id
                     FROM whoisme.messages
-                    WHERE user_id = %s AND session_id = %s
+                    WHERE user_id = %s 
+                    AND session_id = %s
+                    AND is_deleted = FALSE
                     ORDER BY created_at DESC
                     LIMIT %s;
                     """,
@@ -35,6 +37,7 @@ def get_latest_messages(user_id, session_id=None, limit=10):
                     SELECT id, message, reply, created_at, session_id
                     FROM whoisme.messages
                     WHERE user_id = %s
+                    AND is_deleted = FALSE
                     ORDER BY created_at DESC
                     LIMIT %s;
                     """,
@@ -57,7 +60,9 @@ def get_all_messages(user_id, session_id=None):
                     """
                     SELECT message, reply, created_at, session_id
                     FROM whoisme.messages
-                    WHERE user_id = %s AND session_id = %s
+                    WHERE user_id = %s 
+                    AND session_id = %s
+                    AND is_deleted = FALSE
                     ORDER BY id ASC;
                     """,
                     (str(user_id), str(session_id)),
@@ -68,6 +73,7 @@ def get_all_messages(user_id, session_id=None):
                     SELECT message, reply, created_at, session_id
                     FROM whoisme.messages
                     WHERE user_id = %s
+                    AND is_deleted = FALSE
                     ORDER BY id ASC;
                     """,
                     (str(user_id)),
