@@ -377,22 +377,40 @@ def whoisme_sessions():
     if not user_id:
         return jsonify({"error": "Cannot determine user id from token"}), 401
 
+    data = request.get_json(silent=True) or {}
+    limit = int(data.get("limit", 8))
+    offset = int(data.get("offset", 0))
+
     try:
         with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             query = """
+                WITH latest_sessions AS (
+                    SELECT 
+                        session_id,
+                        MAX(created_at) AS last_time
+                    FROM whoisme.messages
+                    WHERE user_id = %s
+                        AND is_deleted = FALSE
+                        AND session_id IS NOT NULL
+                    GROUP BY session_id
+                    ORDER BY MAX(created_at) DESC
+                    LIMIT %s OFFSET %s
+                )
                 SELECT 
-                    session_id,
-                    MIN(created_at) AS started_at,
-                    (ARRAY_AGG(message ORDER BY created_at ASC))[1] AS first_message,
-                    COUNT(*) AS total_messages
-                FROM whoisme.messages
-                WHERE user_id = %s
-                    AND is_deleted = FALSE
-                    AND session_id IS NOT NULL
-                GROUP BY session_id
-                ORDER BY started_at DESC;
+                    m.session_id,
+                    MIN(m.created_at) AS started_at,
+                    (ARRAY_AGG(m.message ORDER BY m.created_at ASC))[1] AS first_message,
+                    COUNT(*) AS total_messages,
+                    MAX(m.created_at) AS last_time
+                FROM whoisme.messages m
+                JOIN latest_sessions ls ON m.session_id = ls.session_id
+                WHERE m.user_id = %s
+                    AND m.is_deleted = FALSE
+                GROUP BY m.session_id
+                ORDER BY last_time DESC;
             """
-            cur.execute(query, (str(user_id),))
+
+            cur.execute(query, (str(user_id), limit, offset, str(user_id)))
             rows = cur.fetchall()
 
             sessions = []
@@ -403,19 +421,24 @@ def whoisme_sessions():
                         started.isoformat() if hasattr(started, "isoformat") else str(started)
                     )
 
+                rec["last_time"] = (
+                    rec["last_time"].isoformat() if hasattr(rec["last_time"], "isoformat") else str(rec["last_time"])
+                )
                 rec["total_messages"] = int(rec.get("total_messages") or 0)
                 rec["first_message"] = str(rec["first_message"]) if rec.get("first_message") else None
                 sessions.append(rec)
 
         return jsonify({
             "user_id": user_id,
+            "limit": limit,
+            "offset": offset,
+            "count": len(sessions),
             "sessions": sessions
         })
 
     except Exception as e:
         print(f"[ERROR whoisme_sessions]: {e}", flush=True)
         return jsonify({"error": "Internal server error"}), 500
-
 
 app.register_blueprint(whoisme_bp)
 
