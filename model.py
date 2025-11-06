@@ -154,7 +154,7 @@ if deepseek_api_key:
             model="deepseek-chat",
             temperature=0.7,
             api_key=deepseek_api_key,
-            base_url="https://api.deepseek.com/v1",
+            base_url="https://api.deepseek.com",
             timeout=30,  # 30 second timeout
         ),
         "DeepSeek Chat"
@@ -165,7 +165,7 @@ if deepseek_api_key:
             model="deepseek-reasoner",
             temperature=0.7,
             api_key=deepseek_api_key,
-            base_url="https://api.deepseek.com/v1",
+            base_url="https://api.deepseek.com",
             timeout=30,
         ),
         "DeepSeek Reasoner"
@@ -261,8 +261,8 @@ if __name__ == "__main__":
     print("Danh sách models khả dụng:", list(models.keys()))
 
     try:
-        print("\n--- Test Gemini Flash ---")
-        res = models["grok-3"]["model"].invoke("Xin chào, bạn có hoạt động không?")
+        print("\n--- Test Deepseek ---")
+        res = models["deepseek-chat"].invoke("Xin chào, bạn có hoạt động không?")
         print("Kết quả:", res.content if hasattr(res, "content") else res)
     except Exception as e:
-        print("❌ Lỗi khi gọi gemini-flash:", e)
+        print("Lỗi khi gọi deepseek:", e)
