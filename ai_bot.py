@@ -35,6 +35,33 @@ def index():
         return redirect("/login-ui")
     return redirect("/chatbot")
 
+@app.route("/health")
+def health_check():
+    """Health check endpoint for monitoring"""
+    try:
+        # Test database connection
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            "status": "healthy",
+            "service": "chatbot_base",
+            "database": "connected",
+            "timestamp": None
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy", 
+            "service": "chatbot_base",
+            "database": "disconnected",
+            "error": str(e),
+            "timestamp": None
+        }), 500
+
 @app.route("/chatbot")
 def chatbot():
     if not session.get("user"):

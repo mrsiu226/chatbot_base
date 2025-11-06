@@ -1,0 +1,19 @@
+[Unit]
+Description=Chatbot WhoIsMe Service
+After=network.target
+
+[Service]
+Type=forking
+User=$USER
+Group=$USER
+WorkingDirectory={{PROJECT_ROOT}}/chatbot_base
+ExecStart={{PROJECT_ROOT}}/chatbot_base/start.sh
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

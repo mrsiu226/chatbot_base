@@ -1,0 +1,198 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # Cho phép trigger thủ công
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run tests (optional)
+      run: |
+        # Uncomment nếu có tests
+        # python -m pytest tests/ || echo "No tests found"
+        echo "Skipping tests for now"
+
+    - name: Deploy to server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.SERVER_HOST }}
+        username: ${{ secrets.SERVER_USERNAME }}
+        key: ${{ secrets.SERVER_SSH_KEY }}
+        port: ${{ secrets.SERVER_PORT || 22 }}
+        script: |
+          # Định nghĩa các biến
+          PROJECT_DIR="${{ secrets.PROJECT_ROOT }}/chatbot_base"
+          BACKUP_DIR="${{ secrets.PROJECT_ROOT }}/backups"
+          
+          echo "🚀 Starting deployment to $PROJECT_DIR"
+          
+          # Tạo thư mục backup nếu chưa có
+          mkdir -p $BACKUP_DIR
+          
+          # Backup code hiện tại (nếu có)
+          if [ -d "$PROJECT_DIR" ]; then
+            echo "📦 Creating backup..."
+            BACKUP_NAME="chatbot_backup_$(date +%Y%m%d_%H%M%S)"
+            cp -r $PROJECT_DIR $BACKUP_DIR/$BACKUP_NAME
+            echo "✅ Backup created: $BACKUP_DIR/$BACKUP_NAME"
+          fi
+          
+          # Clone hoặc pull code mới
+          if [ -d "$PROJECT_DIR" ]; then
+            echo "🔄 Updating existing repository..."
+            cd $PROJECT_DIR
+            git fetch origin
+            git reset --hard origin/main
+            git clean -fd
+          else
+            echo "📥 Cloning repository..."
+            git clone https://github.com/${{ github.repository }}.git $PROJECT_DIR
+            cd $PROJECT_DIR
+          fi
+          
+          echo "✅ Code updated successfully"
+          
+          # Kích hoạt virtual environment
+          echo "🐍 Setting up Python environment..."
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+          fi
+          source venv/bin/activate
+          
+          # Cài đặt dependencies
+          echo "📦 Installing dependencies..."
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install gunicorn
+          
+          # Kiểm tra và tạo file .env nếu cần
+          if [ ! -f ".env" ]; then
+            echo "⚙️ Creating .env file..."
+            echo "PROJECT_ROOT=${{ secrets.PROJECT_ROOT }}" > .env
+            echo "# Add other environment variables as needed" >> .env
+          fi
+          
+          # Đảm bảo PROJECT_ROOT trong .env được cập nhật
+          if grep -q "^PROJECT_ROOT=" .env; then
+            sed -i "s|^PROJECT_ROOT=.*|PROJECT_ROOT=${{ secrets.PROJECT_ROOT }}|" .env
+          else
+            echo "PROJECT_ROOT=${{ secrets.PROJECT_ROOT }}" >> .env
+          fi
+          
+          # Tạo thư mục logs
+          mkdir -p ${{ secrets.PROJECT_ROOT }}/logs
+          
+          # Deploy service
+          echo "🔧 Deploying systemd service..."
+          chmod +x deploy-service.sh service.sh start.sh
+          
+          # Tạo service template nếu chưa có
+          if [ ! -f "chatbot-whoisme.service.template" ]; then
+            echo "📝 Creating service template..."
+            cat > chatbot-whoisme.service.template << 'EOF'
+          [Unit]
+          Description=Chatbot WhoIsMe Service
+          After=network.target
+
+          [Service]
+          Type=forking
+          User=$USER
+          Group=$USER
+          WorkingDirectory={{PROJECT_ROOT}}/chatbot_base
+          ExecStart={{PROJECT_ROOT}}/chatbot_base/start.sh
+          ExecReload=/bin/kill -HUP $MAINPID
+          KillMode=mixed
+          TimeoutStopSec=5
+          PrivateTmp=true
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          fi
+          
+          # Chạy deploy script
+          ./deploy-service.sh
+          
+          # Kiểm tra trạng thái service
+          sleep 5
+          if sudo systemctl is-active --quiet chatbot-whoisme.service; then
+            echo "✅ Service is running successfully!"
+            sudo systemctl status chatbot-whoisme.service --no-pager -l
+          else
+            echo "❌ Service failed to start. Checking logs..."
+            sudo journalctl -u chatbot-whoisme.service --no-pager -l -n 20
+            exit 1
+          fi
+          
+          echo "🎉 Deployment completed successfully!"
+
+    - name: Notify deployment status
+      if: always()
+      run: |
+        if [ "${{ job.status }}" == "success" ]; then
+          echo "✅ Deployment successful!"
+        else
+          echo "❌ Deployment failed!"
+        fi
+
+    - name: Send Telegram notification
+      if: always()
+      run: |
+        # Prepare deployment info
+        COMMIT_MSG=$(git log -1 --pretty=%B | head -1)
+        COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+        COMMIT_HASH=$(git log -1 --pretty=%h)
+        DEPLOY_TIME=$(date '+%Y-%m-%d %H:%M:%S UTC')
+        
+        # Determine status and emoji
+        if [ "${{ job.status }}" == "success" ]; then
+          STATUS="✅ SUCCESS"
+          MESSAGE="🚀 *Deployment Successful!*
+        
+        📦 *Repository:* \`${{ github.repository }}\`
+        🌿 *Branch:* \`${{ github.ref_name }}\`
+        👤 *Author:* \`${COMMIT_AUTHOR}\`
+        💬 *Commit:* \`${COMMIT_HASH}\` - \`${COMMIT_MSG}\`
+        🕐 *Time:* \`${DEPLOY_TIME}\`
+        🖥️ *Server:* \`${{ secrets.SERVER_HOST }}\`
+        
+        ✅ Chatbot service is now running with the latest code!"
+        else
+          STATUS="❌ FAILED"
+          MESSAGE="🚨 *Deployment Failed!*
+        
+        📦 *Repository:* \`${{ github.repository }}\`
+        🌿 *Branch:* \`${{ github.ref_name }}\`
+        👤 *Author:* \`${COMMIT_AUTHOR}\`
+        💬 *Commit:* \`${COMMIT_HASH}\` - \`${COMMIT_MSG}\`
+        🕐 *Time:* \`${DEPLOY_TIME}\`
+        🖥️ *Server:* \`${{ secrets.SERVER_HOST }}\`
+        
+        ❌ Please check the deployment logs and fix the issues."
+        fi
+        
+        # Send to Telegram
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d parse_mode="Markdown" \
+          -d text="${MESSAGE}" \
+          || echo "Failed to send Telegram notification"
