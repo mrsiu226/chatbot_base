@@ -252,20 +252,31 @@ def whoisme_chat():
     knowledge = match_embeddings(query_vector, top_k=5)
     prompt = build_prompt(user_msg, short_term_context, long_term_context, knowledge)
 
-    @stream_with_context
-    def generate():
-        buffer = ""
-        try:
-            for chunk in llm.stream(prompt):
-                content = getattr(chunk, "content", "")
-                if content:
-                    buffer += content
-                    yield content
-            insert_message(user_id, user_msg, buffer, session_id=session_id)
-        except Exception as e:
-            yield f"\n[ERROR]: {str(e)}"
+    message = []
+    full_reply = ""
 
-    return Response(generate(), mimetype="text/plain")
+    try:
+        for chunk in llm.stream(prompt):
+            content = getattr(chunk, "content", "")
+            if content:
+                full_reply += content
+
+        message.append({"role": "assistant", "content": content})
+        insert_message(user_id, user_msg, full_reply, session_id=session_id)
+
+        return jsonify({
+            "user_id": user_id,
+            "session_id": session_id,
+            "model": model_key,
+            "message": [
+                {"role": "user", "content": user_msg},
+                *message
+            ]
+        })
+    
+    except Exception as e:
+        print(f"[ERROR whoisme_chat]: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
 
 #=========API to get chat history==========
 @whoisme_bp.route("/v1/history", methods=["POST"])
