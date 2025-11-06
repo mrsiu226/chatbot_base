@@ -5,7 +5,7 @@ from data.import_data import insert_message
 from data.get_history import get_latest_messages, get_all_messages, get_long_term_context
 from data.embed_messages import embedder
 from utils.jwt_helper import generate_jwt_token, jwt_required
-import os, json, requests, sys, psycopg2
+import os, json, requests, sys, psycopg2, re
 from psycopg2.extras import RealDictCursor
 
 # ---------------- CONFIG ----------------
@@ -245,23 +245,20 @@ def whoisme_chat():
     if not llm:
         return jsonify({"error": "Model không hợp lệ"}), 400
 
+    # ==== Build context ====
     query_vector = embedder.embed(user_msg).tolist()
     short_history = get_latest_messages(user_id, session_id=session_id, limit=5)
-    short_term_context = "\n".join(f"User: {h['message']}\nBot: {h['reply']}" for h in reversed(short_history))
+    short_term_context = "\n".join(
+        f"User: {h['message']}\nBot: {h['reply']}" for h in reversed(short_history)
+    )
     long_term_context = get_long_term_context(user_id, user_msg, session_id=session_id, top_k=3)
     knowledge = match_embeddings(query_vector, top_k=5)
     prompt = build_prompt(user_msg, short_term_context, long_term_context, knowledge)
 
-    message = []
-    full_reply = ""
-
     try:
-        for chunk in llm.stream(prompt):
-            content = getattr(chunk, "content", "")
-            if content:
-                full_reply += content
+        response = llm.invoke(prompt)  # hoặc .generate(prompt) tùy SDK
+        full_reply = getattr(response, "content", "") if response else ""
 
-        message.append({"role": "assistant", "content": content})
         insert_message(user_id, user_msg, full_reply, session_id=session_id)
 
         return jsonify({
@@ -270,10 +267,10 @@ def whoisme_chat():
             "model": model_key,
             "message": [
                 {"role": "user", "content": user_msg},
-                *message
+                {"role": "assistant", "content": full_reply}
             ]
         })
-    
+
     except Exception as e:
         print(f"[ERROR whoisme_chat]: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
@@ -336,7 +333,7 @@ def whoisme_hidden_history():
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
     
 
-#==========Get API to get list of sessions==========    
+#==========Get API to get list of sessions==========  
 
 @whoisme_bp.route("/v1/sessions", methods=["POST"])
 def whoisme_sessions():
@@ -353,29 +350,11 @@ def whoisme_sessions():
     if not user_id:
         return jsonify({"error": "Cannot determine user id from token"}), 401
 
-    data = request.get_json(silent=True) or {}
-    filter_session_id = data.get("session_id")
-
     try:
-        with get_conn() as conn, conn.cursor() as cur:
-            if filter_session_id:
-                query = """
-                SELECT session_id,
-                        MIN(created_at) AS started_at,
-                        (ARRAY_AGG(message ORDER BY created_at ASC))[1] AS first_message,
-                        COUNT(*) AS total_messages
-                FROM whoisme.messages
-                WHERE user_id = %s
-                    AND is_deleted = FALSE
-                    AND session_id IS NOT NULL
-                    AND session_id = %s
-                GROUP BY session_id
-                ORDER BY started_at DESC;
-                """
-                params = (str(user_id), str(filter_session_id))
-            else:
-                query = """
-                SELECT session_id,
+        with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            query = """
+                SELECT 
+                    session_id,
                     MIN(created_at) AS started_at,
                     (ARRAY_AGG(message ORDER BY created_at ASC))[1] AS first_message,
                     COUNT(*) AS total_messages
@@ -385,39 +364,21 @@ def whoisme_sessions():
                     AND session_id IS NOT NULL
                 GROUP BY session_id
                 ORDER BY started_at DESC;
-                """
-                params = (str(user_id),)
-
-            cur.execute(query, params)
+            """
+            cur.execute(query, (str(user_id),))
             rows = cur.fetchall()
 
             sessions = []
-            if rows:
-                if isinstance(rows[0], dict):
-                    iter_rows = rows
-                else:
-                    colnames = [desc[0] for desc in cur.description]
-                    iter_rows = [dict(zip(colnames, row)) for row in rows]
+            for rec in rows:
+                started = rec.get("started_at")
+                if started is not None:
+                    rec["started_at"] = (
+                        started.isoformat() if hasattr(started, "isoformat") else str(started)
+                    )
 
-                for rec in iter_rows:
-                    # Normalize started_at
-                    started = rec.get("started_at")
-                    if started is not None:
-                        try:
-                            rec["started_at"] = started.isoformat()
-                        except Exception:
-                            rec["started_at"] = str(started)
-                    total = rec.get("total_messages")
-                    try:
-                        rec["total_messages"] = int(total) if total is not None else 0
-                    except Exception:
-                        rec["total_messages"] = total
-                    if rec.get("first_message") is None:
-                        rec["first_message"] = None
-                    else:
-                        rec["first_message"] = str(rec["first_message"])
-
-                    sessions.append(rec)
+                rec["total_messages"] = int(rec.get("total_messages") or 0)
+                rec["first_message"] = str(rec["first_message"]) if rec.get("first_message") else None
+                sessions.append(rec)
 
         return jsonify({
             "user_id": user_id,
@@ -427,6 +388,7 @@ def whoisme_sessions():
     except Exception as e:
         print(f"[ERROR whoisme_sessions]: {e}", flush=True)
         return jsonify({"error": "Internal server error"}), 500
+
 
 app.register_blueprint(whoisme_bp)
 
