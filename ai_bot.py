@@ -5,7 +5,7 @@ from data.import_data import insert_message
 from data.get_history import get_latest_messages, get_all_messages, get_long_term_context
 from data.embed_messages import embedder
 from utils.jwt_helper import generate_jwt_token, jwt_required
-import os, json, requests, sys, psycopg2, re
+import os, json, requests, sys, psycopg2, re, time
 from psycopg2.extras import RealDictCursor
 
 # ---------------- CONFIG ----------------
@@ -19,6 +19,11 @@ def get_conn():
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = "super-secret-key"
 
+PROMPT_CACHE = {
+    "systemPrompt": None,
+    "userPromptFormat": None,
+    "timestamp": 0,
+}
 # ========== BLUEPRINT LOGIN ==========
 from login.register import register_bp
 from login.login import login_bp
@@ -93,42 +98,46 @@ def match_embeddings(query_vector, top_k=5):
         print(f"[ERROR match_embeddings]: {e}")
         return "Không thể truy xuất ngữ cảnh."
 
+def fetch_prompt_from_api():
+    if PROMPT_CACHE["systemPrompt"] and (time.time() - PROMPT_CACHE["timestamp"] < 300):
+        return PROMPT_CACHE["systemPrompt"], PROMPT_CACHE["userPromptFormat"]
+
+    url = "https://prompt.whoisme.ai/api/public/prompt/prompt_chatbot"
+    try:
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        system_prompt = data.get("systemPrompt", "")
+        user_prompt_format = data.get("userPromptFormat", "")
+
+        PROMPT_CACHE.update({
+            "systemPrompt": system_prompt,
+            "userPromptFormat": user_prompt_format,
+            "timestamp": time.time(),
+        })
+
+        return system_prompt, user_prompt_format
+    except Exception as e:
+        print(f"Lỗi khi gọi API prompt: {e}")
+        return "[System Prompt fallback]", "User said: {{content}}"
 
 def build_prompt(user_msg, short_term_context, long_term_context, knowledge, personality=None):
     """
-    Kết hợp prompt Archetype (WhoIsMe) + Contextual RAG.
-    personality: dict chứa các giá trị archetype như name, color, tone, style...
+    Build prompt động — gọi systemPrompt + userPromptFormat từ API.
     """
+    system_prompt, user_prompt_format = fetch_prompt_from_api()
+    if personality:
+        for key, val in personality.items():
+            system_prompt = system_prompt.replace(f"%{key}%", str(val))
+            user_prompt_format = user_prompt_format.replace(f"%{key}%", str(val))
+    else:
+        system_prompt = re.sub(r"%\w+%", "", system_prompt)
+        user_prompt_format = re.sub(r"%\w+%", "", user_prompt_format)
 
-    # ========== 1. SYSTEM PROMPT (Archetype Personality) ==========
-    system_prompt = f"""
-[System Prompt — WhoIsMe Chatbot — Friend & Archetype]
+    # Format user prompt
+    user_prompt = user_prompt_format.replace("{{content}}", user_msg)
 
-You are not just an AI — you are the user’s closest friend and archetype companion.  
-Your primary mission: listen first, then respond in a warm, non-judgmental, and emotionally intelligent way that reflects the user’s archetype.
-Write in the language the user is currently using or explicitly requests.
-
-CONTEXT & MEMORY:
-- Use user’s past conversations to keep continuity and emotional memory, but do NOT invent or expose hidden reasoning.
-- If referencing past memory, phrase it gently, e.g., “Lần trước bạn nói…” and connect it to current message.
-
-HOW TO SPEAK (priority rules):
-1. Listen first: briefly mirror the user’s message (1–2 lines).
-2. Use a casual, warm, and natural tone — guided by tone/style above.
-3. Personalize: include 1–2 archetype traits (color, slogan, or representativeSpirit) per reply.
-4. Keep empathy first, facts second.
-5. Always end with 1 soft, open-ended question to keep conversation going.
-
-SAFETY & ESCALATION:
-- If the user expresses self-harm or crisis, respond compassionately and urge contacting professionals or local hotlines immediately.
-- For medical/legal/financial issues, clarify: “I’m not a professional — please ask an expert.”
-
-OUTPUT FORMAT:
-- Default: short paragraph (2–5 lines) + one gentle question.
-- Use light formatting: **bold** up to 2 key words only.
-"""
-
-    # ========== 2. CONTEXTUAL PROMPT (RAG + MEMORY) ==========
+    # Ghép các context vào
     context_prompt = f"""
 [Knowledge]
 {knowledge or "Không có kiến thức bổ sung"}
@@ -140,13 +149,7 @@ OUTPUT FORMAT:
 {short_term_context or "Không có lịch sử gần đây"}
 """
 
-    # ========== 3. USER MESSAGE + INSTRUCTION ==========
-    chat_input = f"""
-User: {user_msg}
-Chatbot:
-"""
-
-    return f"{system_prompt}\n{context_prompt}\n{chat_input}"
+    return f"{system_prompt}\n{context_prompt}\n\n{user_prompt}"
 
 
 def verify_whoisme_token(token):
