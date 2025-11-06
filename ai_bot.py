@@ -5,7 +5,7 @@ from data.import_data import insert_message
 from data.get_history import get_latest_messages, get_all_messages, get_long_term_context
 from data.embed_messages import embedder
 from utils.jwt_helper import generate_jwt_token, jwt_required
-import os, json, requests, sys, psycopg2, re, time
+import os, json, requests, sys, psycopg2, re, time, threading
 from psycopg2.extras import RealDictCursor
 
 # ---------------- CONFIG ----------------
@@ -20,10 +20,13 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = "super-secret-key"
 
 PROMPT_CACHE = {
-    "systemPrompt": None,
-    "userPromptFormat": None,
+    "systemPrompt": "",
+    "userPromptFormat": "",
+    "updatedAt": None,
     "timestamp": 0,
 }
+PROMPT_API_URL = "https://prompt.whoisme.ai/api/public/prompt/prompt_chatbot"
+
 # ========== BLUEPRINT LOGIN ==========
 from login.register import register_bp
 from login.login import login_bp
@@ -126,33 +129,58 @@ def match_embeddings(query_vector, top_k=5):
         return "Không thể truy xuất ngữ cảnh."
 
 def fetch_prompt_from_api():
-    if PROMPT_CACHE["systemPrompt"] and (time.time() - PROMPT_CACHE["timestamp"] < 300):
+    """
+    Gọi API lấy prompt mới nhất.
+    """
+    resp = requests.get(PROMPT_API_URL, timeout=5)
+    resp.raise_for_status()
+    data = resp.json().get("data", {})
+    return {
+        "systemPrompt": data.get("systemPrompt", ""),
+        "userPromptFormat": data.get("userPromptFormat", ""),
+        "updatedAt": data.get("updatedAt"),
+    }
+
+def background_prompt_updater(interval=300):
+    """
+    Thread nền — kiểm tra định kỳ xem prompt có thay đổi không.
+    Nếu có, update lại cache.
+    """
+    while True:
+        try:
+            new_data = fetch_prompt_from_api()
+            if new_data["updatedAt"] != PROMPT_CACHE.get("updatedAt"):
+                PROMPT_CACHE.update(new_data)
+                PROMPT_CACHE["timestamp"] = time.time()
+                print(f"[Prompt Updated] at {new_data['updatedAt']}")
+        except Exception as e:
+            print(f"[Prompt Fetch Error]: {e}")
+        time.sleep(interval)
+
+threading.Thread(target=background_prompt_updater, daemon=True).start()
+
+def get_cached_prompt():
+    """
+    Lấy prompt từ cache (đọc cực nhanh, không gọi API).
+    """
+    if PROMPT_CACHE["systemPrompt"]:
         return PROMPT_CACHE["systemPrompt"], PROMPT_CACHE["userPromptFormat"]
-
-    url = "https://prompt.whoisme.ai/api/public/prompt/prompt_chatbot"
+    # Nếu cache rỗng (lần đầu chạy app) → fetch ngay
     try:
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
-        system_prompt = data.get("systemPrompt", "")
-        user_prompt_format = data.get("userPromptFormat", "")
-
-        PROMPT_CACHE.update({
-            "systemPrompt": system_prompt,
-            "userPromptFormat": user_prompt_format,
-            "timestamp": time.time(),
-        })
-
-        return system_prompt, user_prompt_format
+        data = fetch_prompt_from_api()
+        PROMPT_CACHE.update(data)
+        PROMPT_CACHE["timestamp"] = time.time()
+        return data["systemPrompt"], data["userPromptFormat"]
     except Exception as e:
-        print(f"Lỗi khi gọi API prompt: {e}")
+        print(f"[Prompt Init Error]: {e}")
         return "[System Prompt fallback]", "User said: {{content}}"
 
 def build_prompt(user_msg, short_term_context, long_term_context, knowledge, personality=None):
     """
-    Build prompt động — gọi systemPrompt + userPromptFormat từ API.
+    Build prompt động — đọc từ cache (đã auto reload).
     """
-    system_prompt, user_prompt_format = fetch_prompt_from_api()
+    system_prompt, user_prompt_format = get_cached_prompt()
+
     if personality:
         for key, val in personality.items():
             system_prompt = system_prompt.replace(f"%{key}%", str(val))
@@ -166,18 +194,18 @@ def build_prompt(user_msg, short_term_context, long_term_context, knowledge, per
 
     # Ghép các context vào
     context_prompt = f"""
-[Knowledge]
-{knowledge or "Không có kiến thức bổ sung"}
+
+[Short-term Context]
+{short_term_context or "Không có lịch sử gần đây"}
 
 [Long-term Context]
 {long_term_context or "Không có dữ liệu"}
 
-[Short-term Context]
-{short_term_context or "Không có lịch sử gần đây"}
+[Knowledge]
+{knowledge or "Không có kiến thức bổ sung"}
 """
 
     return f"{system_prompt}\n{context_prompt}\n\n{user_prompt}"
-
 
 def verify_whoisme_token(token):
     WHOISME_API_URL = "https://api.whoisme.ai/api/auth/verify-token"
