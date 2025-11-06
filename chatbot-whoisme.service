@@ -1,0 +1,25 @@
+[Unit]
+Description=Chatbot WhoIsMe AI Application
+After=network.target
+Wants=network.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=/home/chatbotySia/chatbot.whoisme.ai/chatbot_base
+Environment=PROJECT_ROOT=/home/chatbotySia/chatbot.whoisme.ai
+Environment=PATH=/home/chatbotySia/chatbot.whoisme.ai/chatbot_base/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONPATH=/home/chatbotySia/chatbot.whoisme.ai/chatbot_base
+ExecStart=/home/chatbotySia/chatbot.whoisme.ai/chatbot_base/venv/bin/gunicorn --config /home/chatbotySia/chatbot.whoisme.ai/chatbot_base/gunicorn.conf.py ai_bot:app
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/chatbotySia/chatbot.whoisme.ai/logs/service.log
+StandardError=append:/home/chatbotySia/chatbot.whoisme.ai/logs/service.log
+
+[Install]
+WantedBy=multi-user.target

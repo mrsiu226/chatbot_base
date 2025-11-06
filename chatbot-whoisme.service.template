@@ -1,19 +1,25 @@
 [Unit]
-Description=Chatbot WhoIsMe Service
+Description=Chatbot WhoIsMe AI Application
 After=network.target
+Wants=network.target
 
 [Service]
-Type=forking
-User=$USER
-Group=$USER
+Type=exec
+User=root
+Group=root
 WorkingDirectory={{PROJECT_ROOT}}/chatbot_base
-ExecStart={{PROJECT_ROOT}}/chatbot_base/start.sh
-ExecReload=/bin/kill -HUP $MAINPID
+Environment=PROJECT_ROOT={{PROJECT_ROOT}}
+Environment=PATH={{PROJECT_ROOT}}/chatbot_base/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONPATH={{PROJECT_ROOT}}/chatbot_base
+ExecStart={{PROJECT_ROOT}}/chatbot_base/venv/bin/gunicorn --config {{PROJECT_ROOT}}/chatbot_base/gunicorn.conf.py ai_bot:app
+ExecReload=/bin/kill -s HUP $MAINPID
 KillMode=mixed
 TimeoutStopSec=5
 PrivateTmp=true
 Restart=always
 RestartSec=10
+StandardOutput=append:{{PROJECT_ROOT}}/logs/service.log
+StandardError=append:{{PROJECT_ROOT}}/logs/service.log
 
 [Install]
 WantedBy=multi-user.target
