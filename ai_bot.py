@@ -306,7 +306,6 @@ def whoisme_chat():
         timing[label] = round(time.perf_counter() - start_total, 3)
 
     try:
-        # ==== AUTH ====
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return jsonify({"error": "Missing or invalid Authorization header"}), 401
@@ -320,7 +319,6 @@ def whoisme_chat():
         upsert_whoisme_user(user_id, email)
         mark("verified_token")
 
-        # ==== PAYLOAD ====
         payload = request.json or {}
         user_msg = payload.get("message", "").strip()
         session_id = payload.get("session_id")
@@ -333,7 +331,6 @@ def whoisme_chat():
             return jsonify({"error": "Model không hợp lệ"}), 400
         mark("parsed_payload")
 
-        # ==== BUILD CONTEXT ====
         query_vector = embedder.embed(user_msg).tolist()
         short_history = get_latest_messages(user_id, session_id=session_id, limit=5)
         short_term_context = "\n".join(
@@ -344,7 +341,6 @@ def whoisme_chat():
         prompt = build_prompt(user_msg, short_term_context, long_term_context, knowledge)
         mark("context_ready")
 
-        # ==== CALL LLM ====
         start_llm = time.perf_counter()
         response = llm.invoke(prompt)
         end_llm = time.perf_counter()
@@ -353,7 +349,6 @@ def whoisme_chat():
 
         full_reply = getattr(response, "content", "") if response else ""
 
-        # ==== SAVE TO DB ====
         insert_message(user_id, user_msg, full_reply, session_id=session_id, time_spent=elapsed_llm)
         mark("db_inserted")
 
