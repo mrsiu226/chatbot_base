@@ -323,59 +323,81 @@ def chat():
 whoisme_bp = Blueprint("whoisme", __name__)
 
 #=========API to chat with WhoIsMe==========
-import time  # chắc chắn đã import ở đầu file
 
 @whoisme_bp.route("/v1/chat", methods=["POST"])
 def whoisme_chat():
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return jsonify({"error": "Missing or invalid Authorization header"}), 401
+    start_total = time.perf_counter()
+    timing = {}
 
-    token = auth_header.split(" ")[1]
-    user_info = verify_whoisme_token(token)
-    if not user_info:
-        return jsonify({"error": "Invalid WhoIsMe token"}), 401
-
-    user_id, email = user_info.get("userId"), user_info.get("email")
-    upsert_whoisme_user(user_id, email)
-
-    payload = request.json or {}
-    user_msg = payload.get("message", "").strip()
-    session_id = payload.get("session_id")
-    model_key = payload.get("model", "gemini-flash-lite")
-
-    if not user_msg:
-        return jsonify({"error": "Message không được để trống"}), 400
-
-    llm = models.get(model_key)
-    if not llm:
-        return jsonify({"error": "Model không hợp lệ"}), 400
-
-    # ==== Build context ====
-    query_vector = embedder.embed(user_msg).tolist()
-    short_history = get_latest_messages(user_id, session_id=session_id, limit=5)
-    short_term_context = "\n".join(
-        f"User: {h['message']}\nBot: {h['reply']}" for h in reversed(short_history)
-    )
-    long_term_context = get_long_term_context(user_id, user_msg, session_id=session_id, top_k=3)
-    knowledge = match_embeddings(query_vector, top_k=5)
-    prompt = build_prompt(user_msg, short_term_context, long_term_context, knowledge)
+    def mark(label):
+        timing[label] = round(time.perf_counter() - start_total, 3)
 
     try:
-        start_time = time.perf_counter()
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Missing or invalid Authorization header"}), 401
+        token = auth_header.split(" ")[1]
+        mark("got_header")
+
+        user_info = verify_whoisme_token(token)
+        if not user_info:
+            return jsonify({"error": "Invalid WhoIsMe token"}), 401
+        user_id, email = user_info.get("userId"), user_info.get("email")
+        upsert_whoisme_user(user_id, email)
+        mark("verified_token")
+
+        payload = request.json or {}
+        user_msg = payload.get("message", "").strip()
+        session_id = payload.get("session_id")
+        model_key = payload.get("model", "gemini-flash-lite")
+
+        if not user_msg:
+            return jsonify({"error": "Message không được để trống"}), 400
+        llm = models.get(model_key)
+        if not llm:
+            return jsonify({"error": "Model không hợp lệ"}), 400
+        mark("parsed_payload")
+
+        query_vector = embedder.embed(user_msg).tolist()
+        short_history = get_latest_messages(user_id, session_id=session_id, limit=5)
+        short_term_context = "\n".join(
+            f"User: {h['message']}\nBot: {h['reply']}" for h in reversed(short_history)
+        )
+        long_term_context = get_long_term_context(user_id, user_msg, session_id=session_id, top_k=3)
+        knowledge = match_embeddings(query_vector, top_k=5)
+        prompt = build_prompt(user_msg, short_term_context, long_term_context, knowledge)
+        mark("context_ready")
+
+        start_llm = time.perf_counter()
         response = llm.invoke(prompt)
-        end_time = time.perf_counter()
-        elapsed = round(end_time - start_time, 3)  
+        end_llm = time.perf_counter()
+        elapsed_llm = round(end_llm - start_llm, 3)
+        mark("llm_done")
 
         full_reply = getattr(response, "content", "") if response else ""
 
-        insert_message(user_id, user_msg, full_reply, session_id=session_id, time_spent=elapsed)
+        insert_message(user_id, user_msg, full_reply, session_id=session_id, time_spent=elapsed_llm)
+        mark("db_inserted")
+
+        total_elapsed = round(time.perf_counter() - start_total, 3)
+
+        print(
+            f"[TIMING /v1/chat] total={total_elapsed}s "
+            f"| token={timing.get('verified_token', 0)}s "
+            f"| context={timing.get('context_ready', 0)}s "
+            f"| llm={elapsed_llm}s "
+            f"| db={round(time.perf_counter() - end_llm, 3)}s "
+            f"| detail={timing}",
+            flush=True
+        )
 
         return jsonify({
             "user_id": user_id,
             "session_id": session_id,
             "model": model_key,
-            "elapsed": elapsed,
+            "elapsed_total": total_elapsed,
+            "elapsed_llm": elapsed_llm,
+            "timing": timing,
             "message": [
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": full_reply}
@@ -385,30 +407,6 @@ def whoisme_chat():
     except Exception as e:
         print(f"[ERROR whoisme_chat]: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
-
-#=========API to get chat history==========
-@whoisme_bp.route("/v1/history", methods=["POST"])
-def whoisme_history():
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return jsonify({"error": "Missing or invalid Authorization header"}), 401
-
-    token = auth_header.split(" ")[1]
-    user_info = verify_whoisme_token(token)
-    if not user_info:
-        return jsonify({"error": "Invalid WhoIsMe token"}), 401
-
-    user_id = user_info.get("userId")
-    session_id = (request.args.get("session_id") or request.json.get("session_id")) if request.is_json else None
-    if not session_id:
-        return jsonify({"error": "Thiếu session_id"}), 400
-
-    history = get_all_messages(user_id, session_id=session_id)
-    return jsonify({
-        "user_id": user_id, 
-        "session_id": session_id, 
-        "messages": history
-        })
 
 #=========API to hide chat history (soft delete)==========
 @whoisme_bp.route("/v1/hidden", methods=["POST"])
