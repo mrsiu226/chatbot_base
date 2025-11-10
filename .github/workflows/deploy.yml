@@ -167,6 +167,10 @@ jobs:
           if [ -n "${{ secrets.GROK_API_KEY }}" ]; then
             update_env_var "GROK_API_KEY" "${{ secrets.GROK_API_KEY }}"
           fi
+
+          if [ -n "${{ secrets.OPEN_API_KEY }}" ]; then
+            update_env_var "OPEN_API_KEY" "${{ secrets.OPEN_API_KEY }}"
+          fi
           
           if [ -n "${{ secrets.SUPABASE_URL }}" ]; then
             update_env_var "SUPABASE_URL" "${{ secrets.SUPABASE_URL }}"
