@@ -7,6 +7,8 @@ from data.embed_messages import embedder
 from utils.jwt_helper import generate_jwt_token, jwt_required
 import os, json, requests, sys, psycopg2, re, time, threading
 from psycopg2.extras import RealDictCursor
+import jwt
+from jwt import ExpiredSignatureError, InvalidTokenError
 
 # ---------------- CONFIG ----------------
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -207,22 +209,63 @@ def build_prompt(user_msg, short_term_context, long_term_context, knowledge, per
 
     return f"{system_prompt}\n{context_prompt}\n\n{user_prompt}"
 
-def verify_whoisme_token(token):
-    WHOISME_API_URL = "https://api.whoisme.ai/api/auth/verify-token"
-    res = requests.get(WHOISME_API_URL, headers={"Authorization": f"Bearer {token}"})
-    if res.status_code != 200:
-        return None
-    data = res.json()
-    return data[0]["user"] if isinstance(data, list) else data.get("user", {})
+JWT_SECRET = os.getenv("JWT_SECRET", "jwt_secret_ABC123")
+JWT_ALGORITHM = "HS256"
 
+# def verify_whoisme_token(token):
+#     WHOISME_API_URL = "https://api.whoisme.ai/api/auth/verify-token"
+#     res = requests.get(WHOISME_API_URL, headers={"Authorization": f"Bearer {token}"})
+#     if res.status_code != 200:
+#         return None
+#     data = res.json()
+#     return data[0]["user"] if isinstance(data, list) else data.get("user", {})
+
+# def upsert_whoisme_user(user_id, email):
+#     try:
+#         with get_conn() as conn, conn.cursor() as cur:
+#             cur.execute("""
+#                 INSERT INTO whoisme.users (id, email, password_hash, source)
+#                 VALUES (%s, %s, %s, %s)
+#                 ON CONFLICT (email) DO NOTHING;
+#             """, (str(user_id), email, "whoisme", "whoisme.ai"))
+#             conn.commit()
+#     except Exception as e:
+#         print(f"[ERROR upsert_whoisme_user]: {e}")
+
+def verify_whoisme_token(token):
+    try:
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_info = {
+            "userId": decoded.get("userId") or decoded.get("id"),
+            "email": decoded.get("email"),
+            "tokenVersion": decoded.get("tokenVersion"),
+        }
+        if not user_info["userId"] or not user_info["email"]:
+            raise ValueError("Thiếu thông tin userId hoặc email trong token")
+        return user_info
+    except ExpiredSignatureError:
+        print("[verify_whoisme_token] Token đã hết hạn")
+        return None
+    except InvalidTokenError as e:
+        print(f"[verify_whoisme_token] Token không hợp lệ: {e}")
+        return None
+    except Exception as e:
+        print(f"[verify_whoisme_token] Lỗi khác: {e}")
+        return None
+    
 def upsert_whoisme_user(user_id, email):
+    if not user_id or not email:
+        return
     try:
         with get_conn() as conn, conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO whoisme.users (id, email, password_hash, source)
                 VALUES (%s, %s, %s, %s)
-                ON CONFLICT (email) DO NOTHING;
-            """, (str(user_id), email, "whoisme", "whoisme.ai"))
+                ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email;
+                """,
+                (str(user_id), email, "whoisme", "whoisme.ai"),
+            )
             conn.commit()
     except Exception as e:
         print(f"[ERROR upsert_whoisme_user]: {e}")
@@ -258,13 +301,16 @@ def chat():
     @stream_with_context
     def generate():
         buffer = ""
+        start_time = time.perf_counter()
         try:
             for chunk in llm.stream(prompt):
                 content = getattr(chunk, "content", "")
                 if content:
                     buffer += content
                     yield content
-            insert_message(user_id, user_msg, buffer)
+            end_time = time.perf_counter()
+            elapsed = round(end_time - start_time, 3)  # thời gian chạy model (giây)
+            insert_message(user_id, user_msg, buffer, time_spent=elapsed)
         except Exception as e:
             yield f"\n[ERROR]: {str(e)}"
 
@@ -277,6 +323,8 @@ def chat():
 whoisme_bp = Blueprint("whoisme", __name__)
 
 #=========API to chat with WhoIsMe==========
+import time  # chắc chắn đã import ở đầu file
+
 @whoisme_bp.route("/v1/chat", methods=["POST"])
 def whoisme_chat():
     auth_header = request.headers.get("Authorization", "")
@@ -314,15 +362,20 @@ def whoisme_chat():
     prompt = build_prompt(user_msg, short_term_context, long_term_context, knowledge)
 
     try:
-        response = llm.invoke(prompt)  # hoặc .generate(prompt) tùy SDK
+        start_time = time.perf_counter()
+        response = llm.invoke(prompt)
+        end_time = time.perf_counter()
+        elapsed = round(end_time - start_time, 3)  
+
         full_reply = getattr(response, "content", "") if response else ""
 
-        insert_message(user_id, user_msg, full_reply, session_id=session_id)
+        insert_message(user_id, user_msg, full_reply, session_id=session_id, time_spent=elapsed)
 
         return jsonify({
             "user_id": user_id,
             "session_id": session_id,
             "model": model_key,
+            "elapsed": elapsed,
             "message": [
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": full_reply}
