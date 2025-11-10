@@ -1,6 +1,6 @@
 from flask import Flask, request, Response, stream_with_context, redirect, session, jsonify, Blueprint
 from dotenv import load_dotenv
-from model import models
+from model import models, load_prompt_config
 from data.import_data import insert_message
 from data.get_history import get_latest_messages, get_all_messages, get_long_term_context
 from data.embed_messages import embedder
@@ -9,6 +9,7 @@ import os, json, requests, sys, psycopg2, re, time, threading
 from psycopg2.extras import RealDictCursor
 import jwt
 from jwt import ExpiredSignatureError, InvalidTokenError
+from data.cache import get_context, save_context, get_rag_cache, save_rag_cache
 
 # ---------------- CONFIG ----------------
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -27,7 +28,7 @@ PROMPT_CACHE = {
     "updatedAt": None,
     "timestamp": 0,
 }
-PROMPT_API_URL = "https://prompt.whoisme.ai/api/public/prompt/prompt_chatbot"
+PROMPT_API_URL = "https://prompt.whoisme.ai/api/public/prompt/chatgpt_prompt_chatbot"
 
 # ========== BLUEPRINT LOGIN ==========
 from login.register import register_bp
@@ -285,7 +286,8 @@ def chat():
     if not user_msg:
         return Response("Message không được để trống", status=400)
 
-    llm = models.get(model_key)
+    llm = load_prompt_config()
+    model_key = getattr(llm, "name", "gpt-4o")
     if not llm:
         return Response(f"Model '{model_key}' không hợp lệ", status=400)
 
@@ -349,11 +351,14 @@ def whoisme_chat():
         payload = request.json or {}
         user_msg = payload.get("message", "").strip()
         session_id = payload.get("session_id")
-        model_key = payload.get("model", "gemini-flash-lite")
+        # model_key = payload.get("model", "gemini-flash-lite")
 
         if not user_msg:
             return jsonify({"error": "Message không được để trống"}), 400
-        llm = models.get(model_key)
+        
+        llm = load_prompt_config()
+        model_key = getattr(llm, "name", "gemini-pro")
+        
         if not llm:
             return jsonify({"error": "Model không hợp lệ"}), 400
         mark("parsed_payload")
@@ -395,9 +400,6 @@ def whoisme_chat():
             "user_id": user_id,
             "session_id": session_id,
             "model": model_key,
-            "elapsed_total": total_elapsed,
-            "elapsed_llm": elapsed_llm,
-            "timing": timing,
             "message": [
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": full_reply}
