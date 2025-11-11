@@ -264,7 +264,6 @@ def whoisme_chat():
     if not user_msg:
         return jsonify({"error": "Message không được để trống"}), 400
 
-    # response cache
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
     if cached_resp:
         return jsonify({
