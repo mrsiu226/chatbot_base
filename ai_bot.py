@@ -6,8 +6,10 @@ import psycopg2
 from cachetools import TTLCache
 from model import load_prompt_config
 from data.get_history import get_latest_messages, get_long_term_context
-from data.import_data import insert_message
+from data.import_data import insert_message, get_conn
 from data.embed_messages import embedder
+from collections import defaultdict
+
 
 try:
     from utils.jwt_helper import verify_whoisme_token
@@ -37,6 +39,29 @@ app.secret_key = os.getenv("FLASK_SECRET", "super-secret-key")
 SHORT_TERM_CACHE = TTLCache(maxsize=5000, ttl=300)
 LONG_TERM_CACHE = TTLCache(maxsize=5000, ttl=300)
 PROMPT_CACHE = {"systemPrompt": "", "userPromptFormat": "", "updatedAt": None, "timestamp": 0}
+
+#-----------------RESPONSE CACHE----------------
+class ResponseCache:
+    def __init__(self, ttl=60, max_hits=1):
+        self.cache = TTLCache(maxsize=5000, ttl=ttl)
+        self.hits = defaultdict(int)
+        self.max_hits = max_hits
+
+    def get(self, user_id, session_id, message):
+        key = f"{user_id}_{session_id or 'global'}_{hash(message)}"
+        if key in self.cache and self.hits[key] < self.max_hits:
+            self.hits[key] += 1
+            print(f"[RESPONSE_CACHE HIT] {key} (hits={self.hits[key]})")
+            return self.cache[key]
+        return None
+
+    def set(self, user_id, session_id, message, response):
+        key = f"{user_id}_{session_id or 'global'}_{hash(message)}"
+        self.cache[key] = response
+        self.hits[key] = 0
+        print(f"[RESPONSE_CACHE SET] {key}")
+
+RESPONSE_CACHE = ResponseCache(ttl=60, max_hits=1)
 
 # ========== BLUEPRINT LOGIN ==========
 from login.register import register_bp
@@ -70,19 +95,13 @@ def history():
         return jsonify([]), 401
 
     user_id = session["user"]["id"]
+    data = get_long_term_context(user_id)
 
-    try:
-        data = get_long_term_context(user_id)
-        # đảm bảo luôn là list of dict
-        if isinstance(data, dict):
+    if not isinstance(data, list):
+        if data:  
             data = [data]
-        elif not isinstance(data, list):
+        else:
             data = []
-        # optional: filter dict only
-        data = [d for d in data if isinstance(d, dict)]
-    except Exception as e:
-        print(f"[ERROR history]: {e}")
-        data = []
 
     return jsonify(data)
 
@@ -121,7 +140,6 @@ def get_cached_prompt():
     PROMPT_CACHE.update(data)
     PROMPT_CACHE["timestamp"] = time.time()
     return data.get("systemPrompt", ""), data.get("userPromptFormat", "User said: {{content}}")
-
 
 # ---------------- CONTEXT HELPERS ----------------
 def get_short_term(user_id, session_id=None, limit=5):
@@ -181,20 +199,32 @@ whoisme_bp = Blueprint("whoisme", __name__)
 def chat():
     if not session.get("user"):
         return Response("Bạn chưa đăng nhập", status=401)
-
     data = request.json or {}
     user_msg = data.get("message", "").strip()
     if not user_msg:
         return Response("Message không được để trống", status=400)
-
     user_id = session["user"]["id"]
+    session_id = data.get("session_id")
+
+    # check response cache
+    cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
+    if cached_resp:
+        return jsonify({
+            "user_id": user_id,
+            "session_id": session_id,
+            "message": [
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": cached_resp}
+            ]
+        })
+
     llm = load_prompt_config()
     if not llm:
         return Response("Model không hợp lệ", status=400)
 
-    short_msgs = get_short_term(user_id, limit=5)
+    short_msgs = get_short_term(user_id, session_id, limit=5)
     short_ctx = "\n".join(f"User: {m['message']}\nBot: {m['reply']}" for m in reversed(short_msgs))
-    long_ctx = get_long_term(user_id, user_msg, top_k=3)
+    long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=3)
 
     prompt = build_prompt(user_msg, short_ctx, long_ctx)
 
@@ -209,77 +239,70 @@ def chat():
                     buf += content
                     yield content
             elapsed = round(time.perf_counter() - start, 3)
-            async_embed_message(user_id, user_msg, buf, time_spent=elapsed)
+            async_embed_message(user_id, user_msg, buf, session_id=session_id, time_spent=elapsed)
+            RESPONSE_CACHE.set(user_id, session_id, user_msg, buf)
         except Exception as e:
             yield f"\n[ERROR]: {e}"
 
     return Response(generate(), mimetype="text/plain")
 
-
 # ---------------- WHOISME /v1/chat ----------------
 @whoisme_bp.route("/v1/chat", methods=["POST"])
 def whoisme_chat():
-    start_total = time.perf_counter()
-    timing = {}
-    def mark(label): timing[label] = round(time.perf_counter() - start_total, 3)
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid Authorization header"}), 401
+    token = auth_header.split(" ")[1]
+    user_info = verify_whoisme_token(token)
+    if not user_info:
+        return jsonify({"error": "Invalid WhoIsMe token"}), 401
 
-    try:
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return jsonify({"error": "Missing or invalid Authorization header"}), 401
-        token = auth_header.split(" ")[1]
-        mark("got_header")
+    user_id = user_info["userId"]
+    payload = request.json or {}
+    user_msg = payload.get("message", "").strip()
+    session_id = payload.get("session_id")
+    if not user_msg:
+        return jsonify({"error": "Message không được để trống"}), 400
 
-        user_info = verify_whoisme_token(token)
-        if not user_info:
-            return jsonify({"error": "Invalid WhoIsMe token"}), 401
-        user_id = user_info["userId"]
-        mark("verified_token")
-
-        payload = request.json or {}
-        user_msg = payload.get("message", "").strip()
-        session_id = payload.get("session_id")
-        if not user_msg:
-            return jsonify({"error": "Message không được để trống"}), 400
-        mark("parsed_payload")
-
-        llm = load_prompt_config()
-        if not llm:
-            return jsonify({"error": "Model không hợp lệ"}), 400
-
-        short_msgs = get_short_term(user_id, session_id=session_id, limit=5)
-        short_ctx = "\n".join(f"User: {m['message']}\nBot: {m['reply']}" for m in reversed(short_msgs))
-        long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=3)
-
-        prompt = build_prompt(user_msg, short_ctx, long_ctx)
-        mark("context_ready")
-
-        start_llm = time.perf_counter()
-        buffer = ""
-        for chunk in llm.stream(prompt):
-            content = getattr(chunk, "content", "")
-            if content:
-                buffer += content
-        elapsed_llm = round(time.perf_counter() - start_llm, 3)
-        mark("llm_done")
-
-        async_embed_message(user_id, user_msg, buffer, session_id=session_id, time_spent=elapsed_llm)
-        mark("db_inserted")
-        total_elapsed = round(time.perf_counter() - start_total, 3)
-
-        print(f"[TIMING /v1/chat] total={total_elapsed}s | detail={timing}", flush=True)
-
+    # response cache
+    cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
+    if cached_resp:
         return jsonify({
             "user_id": user_id,
             "session_id": session_id,
             "message": [
                 {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": buffer}
+                {"role": "assistant", "content": cached_resp}
             ]
         })
-    except Exception as e:
-        print(f"[ERROR whoisme_chat]: {e}")
-        return jsonify({"error": str(e)}), 500
+
+    llm = load_prompt_config()
+    if not llm:
+        return jsonify({"error": "Model không hợp lệ"}), 400
+
+    short_msgs = get_short_term(user_id, session_id, limit=5)
+    short_ctx = "\n".join(f"User: {m['message']}\nBot: {m['reply']}" for m in reversed(short_msgs))
+    long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=3)
+
+    prompt = build_prompt(user_msg, short_ctx, long_ctx)
+
+    buffer = ""
+    for chunk in llm.stream(prompt):
+        content = getattr(chunk, "content", "")
+        if content:
+            buffer += content
+
+    async_embed_message(user_id, user_msg, buffer, session_id=session_id)
+    RESPONSE_CACHE.set(user_id, session_id, user_msg, buffer)
+
+    return jsonify({
+        "user_id": user_id,
+        "session_id": session_id,
+        "message": [
+            {"role": "user", "content": user_msg},
+            {"role": "assistant", "content": buffer}
+        ]
+    })
 
 #=========API to hide chat history (soft delete)==========
 @whoisme_bp.route("/v1/hidden", methods=["POST"])
