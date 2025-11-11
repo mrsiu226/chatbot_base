@@ -166,9 +166,41 @@ jobs:
     - name: Send Telegram notification
       if: always()
       run: |
-        [ "${{ job.status }}" == "success" ] && STATUS="✅" || STATUS="❌"
-        MESSAGE="${STATUS} Deploy ${{ job.status }}%0A📦 ${{ github.repository }}%0A💬 $(git log -1 --pretty=%h): $(git log -1 --pretty=%B | head -1)"
+        # Prepare deployment info
+        COMMIT_MSG=$(git log -1 --pretty=%B | head -1)
+        COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+        COMMIT_HASH=$(git log -1 --pretty=%h)
+        DEPLOY_TIME=$(date '+%Y-%m-%d %H:%M:%S UTC')
         
+        # Determine status and message
+        if [ "${{ job.status }}" == "success" ]; then
+          MESSAGE="🚀 *Deployment Successful!*
+        
+        📦 *Repository:* \`${{ github.repository }}\`
+        🌿 *Branch:* \`${{ github.ref_name }}\`
+        👤 *Author:* \`${COMMIT_AUTHOR}\`
+        💬 *Commit:* \`${COMMIT_HASH}\` - ${COMMIT_MSG}
+        🕐 *Time:* \`${DEPLOY_TIME}\`
+        🖥️ *Server:* \`${{ secrets.SERVER_HOST }}\`
+        
+        ✅ Chatbot service is now running!"
+        else
+          MESSAGE="🚨 *Deployment Failed!*
+        
+        📦 *Repository:* \`${{ github.repository }}\`
+        🌿 *Branch:* \`${{ github.ref_name }}\`
+        👤 *Author:* \`${COMMIT_AUTHOR}\`
+        💬 *Commit:* \`${COMMIT_HASH}\` - ${COMMIT_MSG}
+        🕐 *Time:* \`${DEPLOY_TIME}\`
+        🖥️ *Server:* \`${{ secrets.SERVER_HOST }}\`
+        
+        ❌ Please check the deployment logs!"
+        fi
+        
+        # Send to Telegram
         if [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
-          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage?chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=${MESSAGE}" > /dev/null
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d parse_mode="Markdown" \
+            -d text="${MESSAGE}"
         fi
