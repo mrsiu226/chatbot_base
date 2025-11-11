@@ -21,7 +21,7 @@ def insert_message(user_id, message, reply=None, session_id=None, time_spent=Non
                     INSERT INTO whoisme.messages (user_id, session_id, message, reply, embedding_vector, time)
                     VALUES (%s, %s, %s, %s, %s, %s)
                     """,
-                    (str(user_id), session_id, message, reply, embedding_vector, time_spent or 0),
+                    (str(user_id), session_id, message, reply, embedding_vector, time_spent),
                 )
             conn.commit()
             print(f"Tin nhắn đã được chèn thành công (session_id={session_id})")

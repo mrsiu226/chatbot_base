@@ -185,6 +185,7 @@
           <div data-provider="grok" data-model="grok-3">Grok 3</div>
           <div data-provider="grok" data-model="grok-4">Grok 4</div>
           <div data-provider="deepseek" data-model="deepseek-chat">DeepSeek Chat</div>
+          <div data-rpovider="gpt" data-model="gpt-4o">GPT-4o</div>
         </div>
       </div>
       <div style="margin-left:8px;cursor:pointer" id="close-btn">✖</div>
@@ -250,23 +251,27 @@
   });
 
   // Hàm load lịch sử từ backend
-  async function loadHistory() {
-    try {
-      const res = await fetch("/history", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" }
-      });
+async function loadHistory() {
+  try {
+    const res = await fetch("/history", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" }
+    });
 
-      const history = await res.json();
-      messages.innerHTML = ""; 
-      history.forEach(msg => {
-        if (msg.message) appendMessage(msg.message, "user");
-        if (msg.reply) appendMessage(msg.reply, "bot");
-      });
-    } catch (err) {
-      console.error("Lỗi tải lịch sử:", err);
-    }
+    const history = await res.json();
+
+    const list = Array.isArray(history) ? history : [];
+
+    messages.innerHTML = ""; 
+    list.forEach(msg => {
+      if (msg.message) appendMessage(msg.message, "user");
+      if (msg.reply) appendMessage(msg.reply, "bot");
+    });
+
+  } catch (err) {
+    console.error("Lỗi tải lịch sử:", err);
   }
+}
 
   let isSending = false;
   async function sendMessage() {
