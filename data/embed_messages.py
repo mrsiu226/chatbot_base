@@ -1,5 +1,6 @@
 import os
 from functools import lru_cache
+from typing import List
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import torch
@@ -39,7 +40,7 @@ class Embedder:
             show_progress_bar=False
         )
 
-    def embed_batch(self, texts: list[str], batch_size: int = 32):
+    def embed_batch(self, texts: List[str], batch_size: int = 32):
         texts = [t.strip() for t in texts if t and t.strip()]
         if not texts:
             return np.array([], dtype=np.float32)
