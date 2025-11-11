@@ -30,3 +30,8 @@ data/embeddings/*.pkl
 check_model.py
 
 source/
+.env.backup.20251111_105143
+.gitignore
+chatbot-whoisme.service
+chatbot-whoisme.service.template
+$file
