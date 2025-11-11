@@ -13,22 +13,6 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-
-    - name: Run tests (optional)
-      run: |
-        # Uncomment nếu có tests
-        # python -m pytest tests/ || echo "No tests found"
-        echo "Skipping tests for now"
-
     - name: Deploy to server
       uses: appleboy/ssh-action@v1.0.3
       with:
@@ -39,20 +23,8 @@ jobs:
         script: |
           # Định nghĩa các biến
           PROJECT_DIR="${{ secrets.PROJECT_ROOT }}/chatbot_base"
-          BACKUP_DIR="${{ secrets.PROJECT_ROOT }}/backups"
           
           echo "🚀 Starting deployment to $PROJECT_DIR"
-          
-          # Tạo thư mục backup nếu chưa có
-          mkdir -p $BACKUP_DIR
-          
-          # Backup code hiện tại (nếu có)
-          if [ -d "$PROJECT_DIR" ]; then
-            echo "📦 Creating backup..."
-            BACKUP_NAME="chatbot_backup_$(date +%Y%m%d_%H%M%S)"
-            cp -r $PROJECT_DIR $BACKUP_DIR/$BACKUP_NAME
-            echo "✅ Backup created: $BACKUP_DIR/$BACKUP_NAME"
-          fi
           
           # Clone hoặc pull code mới với error handling
           if [ -d "$PROJECT_DIR" ]; then
@@ -91,40 +63,12 @@ jobs:
           fi
           
           source venv/bin/activate || { echo "❌ Failed to activate virtual environment"; exit 1; }
-          echo "✅ Virtual environment activated"
           
-          # Verify Python environment
-          python --version
-          which python
-          which pip
-          
-          # Cài đặt dependencies với error handling
+          # Cài đặt dependencies
           echo "📦 Installing dependencies..."
           pip install --upgrade pip
-          
-          # Install requirements với retry và error handling
-          for i in {1..3}; do
-            if pip install -r requirements.txt; then
-              echo "✅ Requirements installed successfully"
-              break
-            else
-              echo "⚠️ Attempt $i/3: Failed to install requirements, retrying..."
-              if [ $i -eq 3 ]; then
-                echo "❌ Failed to install requirements after 3 attempts"
-                exit 1
-              fi
-              sleep 5
-            fi
-          done
-          
-          # Install gunicorn
+          pip install -r requirements.txt || { echo "❌ Failed to install requirements"; exit 1; }
           pip install gunicorn python-dotenv
-          
-          # Backup .env file nếu tồn tại
-          if [ -f ".env" ]; then
-            echo "💾 Backing up existing .env file..."
-            cp .env .env.backup.$(date +%Y%m%d_%H%M%S)
-          fi
           
           # Function to update or add environment variable
           update_env_var() {
@@ -145,95 +89,28 @@ jobs:
             fi
           }
           
-          # Tạo file .env cơ bản nếu chưa có
+          # Tạo file .env
           echo "⚙️ Creating/updating .env file..."
-          if [ ! -f ".env" ]; then
-            echo "# Project configuration - DO NOT EDIT THIS LINE" > .env
-            echo "PROJECT_ROOT=PLACEHOLDER" >> .env
-          fi
+          [ ! -f ".env" ] && echo "PROJECT_ROOT=PLACEHOLDER" > .env
           
-          # Always update PROJECT_ROOT (required)
+          # Update environment variables
           update_env_var "PROJECT_ROOT" "${{ secrets.PROJECT_ROOT }}"
+          update_env_var "GOOGLE_API_KEY" "${{ secrets.GOOGLE_API_KEY }}"
+          update_env_var "DEEPSEEK_API_KEY" "${{ secrets.DEEPSEEK_API_KEY }}"
+          update_env_var "GROK_API_KEY" "${{ secrets.GROK_API_KEY }}"
+          update_env_var "OPEN_API_KEY" "${{ secrets.OPEN_API_KEY }}"
+          update_env_var "SUPABASE_URL" "${{ secrets.SUPABASE_URL }}"
+          update_env_var "SUPABASE_KEY" "${{ secrets.SUPABASE_KEY }}"
+          update_env_var "POSTGRES_URL" "${{ secrets.POSTGRES_URL }}"
+          update_env_var "CHATBOT_API_KEY" "${{ secrets.CHATBOT_API_KEY }}"
+          update_env_var "OPENAI_API_KEY" "${{ secrets.OPENAI_API_KEY }}"
+          update_env_var "GOOGLE_SHEET_ID" "${{ secrets.GOOGLE_SHEET_ID }}"
+          update_env_var "JWT_SECRET" "${{ secrets.JWT_SECRET }}"
+          update_env_var "APP_SECRET_KEY" "${{ secrets.APP_SECRET_KEY }}"
           
-          # Update API keys only if provided in secrets
-          if [ -n "${{ secrets.GOOGLE_API_KEY }}" ]; then
-            update_env_var "GOOGLE_API_KEY" "${{ secrets.GOOGLE_API_KEY }}"
-          fi
-          
-          if [ -n "${{ secrets.DEEPSEEK_API_KEY }}" ]; then
-            update_env_var "DEEPSEEK_API_KEY" "${{ secrets.DEEPSEEK_API_KEY }}"
-          fi
-          
-          if [ -n "${{ secrets.GROK_API_KEY }}" ]; then
-            update_env_var "GROK_API_KEY" "${{ secrets.GROK_API_KEY }}"
-          fi
-
-          if [ -n "${{ secrets.OPEN_API_KEY }}" ]; then
-            update_env_var "OPEN_API_KEY" "${{ secrets.OPEN_API_KEY }}"
-          fi
-          
-          if [ -n "${{ secrets.SUPABASE_URL }}" ]; then
-            update_env_var "SUPABASE_URL" "${{ secrets.SUPABASE_URL }}"
-          fi
-          
-          if [ -n "${{ secrets.SUPABASE_KEY }}" ]; then
-            update_env_var "SUPABASE_KEY" "${{ secrets.SUPABASE_KEY }}"
-          fi
-          
-          if [ -n "${{ secrets.POSTGRES_URL }}" ]; then
-            update_env_var "POSTGRES_URL" "${{ secrets.POSTGRES_URL }}"
-          fi
-          
-          if [ -n "${{ secrets.CHATBOT_API_KEY }}" ]; then
-            update_env_var "CHATBOT_API_KEY" "${{ secrets.CHATBOT_API_KEY }}"
-          fi
-          
-          # Add any additional environment variables here
-          # Example: update_env_var "NEW_VARIABLE" "${{ secrets.NEW_VARIABLE }}"
-          
-          # Thêm các biến mới từ secrets nếu có
-          # Danh sách các biến có thể thêm:
-          if [ -n "${{ secrets.OPENAI_API_KEY }}" ]; then
-            update_env_var "OPENAI_API_KEY" "${{ secrets.OPENAI_API_KEY }}"
-          fi
-          
-          if [ -n "${{ secrets.GOOGLE_SHEET_ID }}" ]; then
-            update_env_var "GOOGLE_SHEET_ID" "${{ secrets.GOOGLE_SHEET_ID }}"
-          fi
-          
-          if [ -n "${{ secrets.JWT_SECRET }}" ]; then
-            update_env_var "JWT_SECRET" "${{ secrets.JWT_SECRET }}"
-          fi
-          
-          if [ -n "${{ secrets.APP_SECRET_KEY }}" ]; then
-            update_env_var "APP_SECRET_KEY" "${{ secrets.APP_SECRET_KEY }}"
-          fi
-          
-          # Display updated environment variables (without sensitive values)
-          echo "📋 Environment variables configured:"
-          grep -E "^[A-Z_]+" .env | sed 's/=.*/=***/' | while read line; do
-            echo "  $line"
-          done
-          
-          # Tạo thư mục logs
+          # Tạo thư mục logs và chuẩn bị scripts
           mkdir -p ${{ secrets.PROJECT_ROOT }}/logs
-          
-          # Chuẩn bị deployment scripts
-          echo "🔧 Preparing deployment scripts..."
-          chmod +x deploy-service.sh service.sh start.sh 2>/dev/null || {
-            echo "⚠️ Some scripts not found, creating them..."
-          }
-          
-          # Đảm bảo scripts tồn tại và có quyền thực thi
-          if [ -f "deploy-service.sh" ]; then
-            chmod +x deploy-service.sh
-          fi
-          if [ -f "service.sh" ]; then
-            chmod +x service.sh
-          fi
-          if [ -f "start.sh" ]; then
-            chmod +x start.sh
-          fi
+          chmod +x deploy-service.sh service.sh start.sh 2>/dev/null || true
           
           # Tạo service template nếu chưa có hoặc cập nhật template hiện có
           echo "📝 Creating/updating service template..."
@@ -263,133 +140,35 @@ jobs:
           echo '[Install]' >> chatbot-whoisme.service.template
           echo 'WantedBy=multi-user.target' >> chatbot-whoisme.service.template
           
-          # Chạy deploy script với error handling
-          echo "🚀 Running deployment script..."
-          if ./deploy-service.sh; then
-            echo "✅ Deploy script completed successfully"
-          else
-            echo "❌ Deploy script failed. Trying manual steps..."
-            
-            # Manual fallback deployment
-            echo "🔧 Manual service deployment..."
-            
-            # Generate service file manually
+          # Deploy service
+          echo "🚀 Deploying service..."
+          if ! ./deploy-service.sh; then
+            # Manual fallback
             sed "s|{{PROJECT_ROOT}}|${{ secrets.PROJECT_ROOT }}|g" chatbot-whoisme.service.template > chatbot-whoisme.service
-            
-            # Deploy service manually
             sudo cp chatbot-whoisme.service /etc/systemd/system/
             sudo systemctl daemon-reload
-            
-            # Stop service if running
             sudo systemctl stop chatbot-whoisme.service 2>/dev/null || true
-            
-            # Enable and start service
-            sudo systemctl enable chatbot-whoisme.service
-            sudo systemctl start chatbot-whoisme.service
+            sudo systemctl enable --now chatbot-whoisme.service
           fi
           
-          # Kiểm tra trạng thái service với retry
-          echo "🔍 Checking service status..."
-          for i in {1..5}; do
-            sleep 2
-            if sudo systemctl is-active --quiet chatbot-whoisme.service; then
-              echo "✅ Service is running successfully!"
-              sudo systemctl status chatbot-whoisme.service --no-pager -l
-              
-              # Test HTTP endpoint
-              echo "🌐 Testing HTTP endpoint..."
-              if curl -s -I http://127.0.0.1:8200/ | grep -q "HTTP/1.1"; then
-                echo "✅ HTTP endpoint is responding"
-              else
-                echo "⚠️ HTTP endpoint not responding yet, but service is running"
-              fi
-              break
-            else
-              echo "⏳ Attempt $i/5: Service not ready yet..."
-              if [ $i -eq 5 ]; then
-                echo "❌ Service failed to start after 5 attempts. Checking logs..."
-                sudo journalctl -u chatbot-whoisme.service --no-pager -l -n 30
-                echo "📋 Service file content:"
-                cat /etc/systemd/system/chatbot-whoisme.service
-                exit 1
-              fi
-            fi
-          done
-          
-          # Final validation
-          echo "🔍 Final deployment validation..."
-          
-          # Check if service is enabled for auto-start
-          if sudo systemctl is-enabled --quiet chatbot-whoisme.service; then
-            echo "✅ Service is enabled for auto-start"
+          # Kiểm tra service
+          echo "🔍 Verifying service..."
+          sleep 3
+          if sudo systemctl is-active --quiet chatbot-whoisme.service; then
+            echo "✅ Service is running!"
+            sudo systemctl status chatbot-whoisme.service --no-pager -l
           else
-            echo "⚠️ Service is not enabled for auto-start"
-            sudo systemctl enable chatbot-whoisme.service
+            echo "❌ Service failed to start!"
+            sudo journalctl -u chatbot-whoisme.service --no-pager -n 20
+            exit 1
           fi
-          
-          # Display final status
-          echo "📊 Final deployment status:"
-          echo "  - Service status: $(sudo systemctl is-active chatbot-whoisme.service)"
-          echo "  - Service enabled: $(sudo systemctl is-enabled chatbot-whoisme.service)"
-          echo "  - Process count: $(ps aux | grep gunicorn | grep -v grep | wc -l)"
-          echo "  - Port 8200: $(netstat -tlnp | grep 8200 | wc -l) listener(s)"
-          
-          echo "🎉 Deployment completed successfully!"
-
-    - name: Notify deployment status
-      if: always()
-      run: |
-        if [ "${{ job.status }}" == "success" ]; then
-          echo "✅ Deployment successful!"
-        else
-          echo "❌ Deployment failed!"
-        fi
 
     - name: Send Telegram notification
       if: always()
       run: |
-        # Prepare deployment info
-        COMMIT_MSG=$(git log -1 --pretty=%B | head -1)
-        COMMIT_AUTHOR=$(git log -1 --pretty=%an)
-        COMMIT_HASH=$(git log -1 --pretty=%h)
-        DEPLOY_TIME=$(date '+%Y-%m-%d %H:%M:%S UTC')
+        [ "${{ job.status }}" == "success" ] && STATUS="✅" || STATUS="❌"
+        MESSAGE="${STATUS} Deploy ${{ job.status }}%0A📦 ${{ github.repository }}%0A💬 $(git log -1 --pretty=%h): $(git log -1 --pretty=%B | head -1)"
         
-        # Determine status and emoji
-        if [ "${{ job.status }}" == "success" ]; then
-          STATUS="✅ SUCCESS"
-          MESSAGE="🚀 *Deployment Successful!*
-        
-        📦 *Repository:* \`${{ github.repository }}\`
-        🌿 *Branch:* \`${{ github.ref_name }}\`
-        👤 *Author:* \`${COMMIT_AUTHOR}\`
-        💬 *Commit:* \`${COMMIT_HASH}\` - \`${COMMIT_MSG}\`
-        🕐 *Time:* \`${DEPLOY_TIME}\`
-        🖥️ *Server:* \`${{ secrets.SERVER_HOST }}\`
-        
-        ✅ Chatbot service is now running with the latest code!"
-        else
-          STATUS="❌ FAILED"
-          MESSAGE="🚨 *Deployment Failed!*
-        
-        📦 *Repository:* \`${{ github.repository }}\`
-        🌿 *Branch:* \`${{ github.ref_name }}\`
-        👤 *Author:* \`${COMMIT_AUTHOR}\`
-        💬 *Commit:* \`${COMMIT_HASH}\` - \`${COMMIT_MSG}\`
-        🕐 *Time:* \`${DEPLOY_TIME}\`
-        🖥️ *Server:* \`${{ secrets.SERVER_HOST }}\`
-        
-        ❌ Please check the deployment logs and fix the issues."
-        fi
-        
-        # Send to Telegram if tokens are available
         if [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
-          echo "📱 Sending Telegram notification..."
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d parse_mode="Markdown" \
-            -d text="${MESSAGE}" \
-            && echo "✅ Telegram notification sent successfully" \
-            || echo "❌ Failed to send Telegram notification"
-        else
-          echo "⚠️ Telegram credentials not configured, skipping notification"
+          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage?chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=${MESSAGE}" > /dev/null
         fi
