@@ -353,7 +353,8 @@ def whoisme_history():
     if not session_id:
         return jsonify({"error": "Thiếu session_id"}), 400
 
-    history = get_long_term_context(user_id, session_id=session_id)
+    query_text = (request.json or {}).get("query", "")
+    history = get_long_term_context(user_id, query=query_text, session_id=session_id)
     return jsonify({
         "user_id": user_id, 
         "session_id": session_id, 
