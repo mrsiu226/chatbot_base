@@ -291,7 +291,6 @@ def whoisme_chat():
     if not user_msg:
         return jsonify({"error": "Message không được để trống"}), 400
 
-    # response cache
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
     if cached_resp:
         return jsonify({
@@ -381,7 +380,8 @@ def whoisme_history():
     if not session_id:
         return jsonify({"error": "Thiếu session_id"}), 400
 
-    history = get_long_term_context(user_id, session_id=session_id)
+    query_text = (request.json or {}).get("query", "")
+    history = get_long_term_context(user_id, query=query_text, session_id=session_id)
     return jsonify({
         "user_id": user_id, 
         "session_id": session_id, 
