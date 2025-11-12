@@ -170,16 +170,22 @@ def get_cached_prompt():
     return data.get("systemPrompt", ""), data.get("userPromptFormat", "User said: {{content}}")
 
 # ---------------- CONTEXT HELPERS ----------------
-def get_short_term(user_id, session_id=None, limit=5):
+def get_short_term(user_id, session_id=None, limit=5, new_message=None, new_reply=None):
     key = f"{user_id}_{session_id or 'global'}"
     if key in SHORT_TERM_CACHE:
+        messages = SHORT_TERM_CACHE[key]
         print(f"[CACHE HIT] short_term: {key}")
-        return SHORT_TERM_CACHE[key]
-    print(f"[CACHE MISS] short_term: {key}")
-    messages = get_latest_messages(user_id, session_id, limit)
-    SHORT_TERM_CACHE[key] = messages
+    else:
+        print(f"[CACHE MISS] short_term: {key}")
+        messages = get_latest_messages(user_id, session_id, limit)
+        SHORT_TERM_CACHE[key] = messages
+    if new_message is not None and new_reply is not None:
+        messages.append({"message": new_message, "reply": new_reply})
+        if len(messages) > limit:
+            messages = messages[-limit:]
+        SHORT_TERM_CACHE[key] = messages
+        print(f"[SHORT_TERM_CACHE UPDATED] {key} (total={len(messages)})")
     return messages
-
 
 def get_long_term(user_id, query, session_id=None, top_k=3):
     key = f"{user_id}_{session_id or 'global'}_{query}"
@@ -249,7 +255,8 @@ def chat():
     llm = load_prompt_config()
     if not llm:
         return Response("Model không hợp lệ", status=400)
-
+    
+    # Lấy short-term hiện tại (không thêm user message lúc này, sẽ cập nhật sau khi có reply)
     short_msgs = get_short_term(user_id, session_id, limit=10)
     long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=5)
     messages = build_structured_prompt(user_msg, short_msgs, long_ctx)
@@ -265,6 +272,11 @@ def chat():
                     buf += content
                     yield content
             elapsed = round(time.perf_counter() - start, 3)
+            # cập nhật short-term cache với trao đổi vừa xảy ra
+            try:
+                get_short_term(user_id, session_id, limit=10, new_message=user_msg, new_reply=buf)
+            except Exception as _:
+                pass
             async_embed_message(user_id, user_msg, buf, session_id=session_id, time_spent=elapsed)
             RESPONSE_CACHE.set(user_id, session_id, user_msg, buf)
         except Exception as e:
@@ -305,6 +317,7 @@ def whoisme_chat():
     if not llm:
         return jsonify({"error": "Model không hợp lệ"}), 400
 
+    # Không thêm user message vào short-term ngay — cập nhật sau khi có buffer (reply)
     short_msgs = get_short_term(user_id, session_id, limit=10)
     long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=5)
     messages = build_structured_prompt(user_msg, short_msgs, long_ctx)
@@ -315,6 +328,11 @@ def whoisme_chat():
         if content:
             buffer += content
 
+    # cập nhật cache short-term với reply vừa tạo
+    try:
+        get_short_term(user_id, session_id, limit=10, new_message=user_msg, new_reply=buffer)
+    except Exception:
+        pass
     async_embed_message(user_id, user_msg, buffer, session_id=session_id)
     RESPONSE_CACHE.set(user_id, session_id, user_msg, buffer)
 
