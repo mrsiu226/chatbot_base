@@ -5,7 +5,7 @@ from psycopg2.extras import RealDictCursor
 import psycopg2
 from cachetools import TTLCache
 from model import load_prompt_config
-from data.get_history import get_latest_messages, get_long_term_context
+from data.get_history import get_latest_messages, get_long_term_context, get_full_history
 from data.import_data import insert_message, get_conn
 from data.embed_messages import embedder
 from collections import defaultdict
@@ -353,16 +353,14 @@ def whoisme_history():
     if not session_id:
         return jsonify({"error": "Thiếu session_id"}), 400
 
-    query_text = (request.json or {}).get("query", "")
-    history = get_long_term_context(user_id, query=query_text, session_id=session_id)
+    history = get_full_history(user_id, session_id)
     return jsonify({
-        "user_id": user_id, 
-        "session_id": session_id, 
+        "user_id": user_id,
+        "session_id": session_id,
         "messages": history
-        })
-    
-#==========Get API to get list of sessions==========  
+    })
 
+#==========Get API to get list of sessions==========  
 @whoisme_bp.route("/v1/sessions", methods=["POST"])
 def whoisme_sessions():
     auth_header = request.headers.get("Authorization", "")

@@ -23,9 +23,6 @@ def get_conn():
 short_term_cache = TTLCache(maxsize=5000, ttl=300)  # 5 phút
 
 def get_latest_messages(user_id, session_id=None, limit=10):
-    """
-    Lấy lịch sử gần đây nhất (short-term context)
-    """
     cache_key = f"{user_id}_{session_id or 'global'}"
     if cache_key in short_term_cache:
         return short_term_cache[cache_key]
@@ -74,13 +71,9 @@ def to_float_array(vec):
 
 @lru_cache(maxsize=2000)
 def cached_embed_query(text: str):
-    """Cache embed query để giảm thời gian encode"""
     return embedder.embed(text)
 
 def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int = 5, debug: bool = False):
-    """
-    Lấy long-term context (RAG) bằng cách tìm message tương tự trong DB theo vector similarity.
-    """
     cache_key = f"{user_id}_{session_id or 'global'}_{query}_{top_k}"
     if cache_key in rag_cache:
         if debug:
@@ -89,7 +82,6 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
 
     start_total = time.time()
 
-    # 1️⃣ Embed query (vector hoá)
     t0 = time.time()
     q_vec = to_float_array(cached_embed_query(query))
     embed_time = time.time() - t0
@@ -99,7 +91,6 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
             print("[get_long_term_context] ⚠️ Không tạo được vector query")
         return ""
 
-    # 2️⃣ Truy vấn Postgres
     try:
         with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             t1 = time.time()
@@ -128,9 +119,9 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
             total_time = time.time() - start_total
 
             if debug:
-                print(f"[⏱️ Embed time] {embed_time:.3f}s")
-                print(f"[⏱️ Query time] {query_time:.3f}s")
-                print(f"[✅ Total RAG time] {total_time:.3f}s")
+                print(f"[⏱Embed time] {embed_time:.3f}s")
+                print(f"[⏱Query time] {query_time:.3f}s")
+                print(f"[Total RAG time] {total_time:.3f}s")
                 for r in rows:
                     print(f"   🔹 {r['id']} → sim={r['similarity']:.3f}")
 
@@ -146,8 +137,36 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
             return context_text
 
     except Exception as e:
-        print(f"[get_long_term_context] ❌ Lỗi PostgreSQL: {e}")
+        print(f"[get_long_term_context] Lỗi PostgreSQL: {e}")
         return ""
+
+def get_full_history(user_id: str, session_id: str):
+    try:
+        with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, message, reply, created_at
+                FROM whoisme.messages
+                WHERE user_id = %s 
+                    AND session_id = %s
+                    AND is_deleted = FALSE
+                ORDER BY created_at ASC;
+            """, (str(user_id), str(session_id)))
+            rows = cur.fetchall()
+
+            messages = [
+                {
+                    "id": r["id"],
+                    "message": r["message"],
+                    "reply": r["reply"],
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None
+                }
+                for r in rows
+            ]
+
+            return messages
+    except Exception as e:
+        print(f"[get_full_history] Lỗi PostgreSQL: {e}")
+        return []
 
 # -----------------------------
 # Test nhanh
