@@ -36,13 +36,14 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = os.getenv("FLASK_SECRET", "super-secret-key")
 
 # ---------------- CACHE ----------------
-SHORT_TERM_CACHE = TTLCache(maxsize=5000, ttl=300)
-LONG_TERM_CACHE = TTLCache(maxsize=5000, ttl=300)
+SHORT_TERM_CACHE = TTLCache(maxsize=5000, ttl=1800)  
+LONG_TERM_CACHE = TTLCache(maxsize=5000, ttl=900)   
 PROMPT_CACHE = {"systemPrompt": "", "userPromptFormat": "", "updatedAt": None, "timestamp": 0}
 
 #-----------------RESPONSE CACHE----------------
+# Response cache (tránh lặp câu quá nhanh)
 class ResponseCache:
-    def __init__(self, ttl=60, max_hits=1):
+    def __init__(self, ttl=120, max_hits=1):
         self.cache = TTLCache(maxsize=5000, ttl=ttl)
         self.hits = defaultdict(int)
         self.max_hits = max_hits
@@ -61,7 +62,7 @@ class ResponseCache:
         self.hits[key] = 0
         print(f"[RESPONSE_CACHE SET] {key}")
 
-RESPONSE_CACHE = ResponseCache(ttl=60, max_hits=1)
+RESPONSE_CACHE = ResponseCache(ttl=120, max_hits=1)
 
 # ========== BLUEPRINT LOGIN ==========
 from login.register import register_bp
@@ -190,9 +191,8 @@ def get_long_term(user_id, query, session_id=None, top_k=3):
     LONG_TERM_CACHE[key] = context
     return context
 
-def build_prompt(user_msg, short_term_context, long_term_context, personality=None):
+def build_structured_prompt(user_msg, short_msgs, long_context, personality=None):
     system_prompt, user_prompt_format = get_cached_prompt()
-
     if personality:
         for k, v in personality.items():
             system_prompt = system_prompt.replace(f"%{k}%", str(v))
@@ -201,22 +201,23 @@ def build_prompt(user_msg, short_term_context, long_term_context, personality=No
         system_prompt = re.sub(r"%\w+%", "", system_prompt)
         user_prompt_format = re.sub(r"%\w+%", "", user_prompt_format)
 
-    user_prompt = user_prompt_format.replace("{{content}}", user_msg)
-
-    context_prompt = f"""
-[Short-term Context]
-{short_term_context or 'Không có lịch sử gần đây'}
-
-[Long-term Context]
-{long_term_context or 'Không có dữ liệu'}
-"""
-    return f"{system_prompt}\n{context_prompt}\n\n{user_prompt}"
+    # Structured messages
+    messages = [{"role": "system", "content": system_prompt}]
+    # Short-term history
+    for m in short_msgs:
+        messages.append({"role": "user", "content": m["message"]})
+        messages.append({"role": "assistant", "content": m["reply"]})
+    # Long-term context
+    if long_context:
+        messages.append({"role": "system", "content": long_context})
+    # Current message
+    messages.append({"role": "user", "content": user_msg})
+    return messages
 
 
 # ---------------- ASYNC DB ----------------
 def async_embed_message(user_id, message, reply, session_id=None, time_spent=None):
     threading.Thread(target=lambda: insert_message(user_id, message, reply, session_id, time_spent), daemon=True).start()
-
 
 # ---------------- BLUEPRINT ----------------
 whoisme_bp = Blueprint("whoisme", __name__)
@@ -233,7 +234,7 @@ def chat():
     user_id = session["user"]["id"]
     session_id = data.get("session_id")
 
-    # check response cache
+    # Response cache
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
     if cached_resp:
         return jsonify({
@@ -249,18 +250,16 @@ def chat():
     if not llm:
         return Response("Model không hợp lệ", status=400)
 
-    short_msgs = get_short_term(user_id, session_id, limit=5)
-    short_ctx = "\n".join(f"User: {m['message']}\nBot: {m['reply']}" for m in reversed(short_msgs))
-    long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=3)
-
-    prompt = build_prompt(user_msg, short_ctx, long_ctx)
+    short_msgs = get_short_term(user_id, session_id, limit=10)
+    long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=5)
+    messages = build_structured_prompt(user_msg, short_msgs, long_ctx)
 
     @stream_with_context
     def generate():
         buf = ""
         start = time.perf_counter()
         try:
-            for chunk in llm.stream(prompt):
+            for chunk in llm.stream(messages):
                 content = getattr(chunk, "content", "")
                 if content:
                     buf += content
@@ -306,14 +305,12 @@ def whoisme_chat():
     if not llm:
         return jsonify({"error": "Model không hợp lệ"}), 400
 
-    short_msgs = get_short_term(user_id, session_id, limit=5)
-    short_ctx = "\n".join(f"User: {m['message']}\nBot: {m['reply']}" for m in reversed(short_msgs))
-    long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=3)
-
-    prompt = build_prompt(user_msg, short_ctx, long_ctx)
+    short_msgs = get_short_term(user_id, session_id, limit=10)
+    long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=5)
+    messages = build_structured_prompt(user_msg, short_msgs, long_ctx)
 
     buffer = ""
-    for chunk in llm.stream(prompt):
+    for chunk in llm.stream(messages):
         content = getattr(chunk, "content", "")
         if content:
             buffer += content
