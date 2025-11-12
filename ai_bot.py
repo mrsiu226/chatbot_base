@@ -1,4 +1,4 @@
-import os, sys, re, time, threading, requests
+import os, sys, re, time, threading, requests, traceback
 from flask import Flask, request, Response, stream_with_context, session, redirect, jsonify, Blueprint
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
@@ -9,8 +9,35 @@ from data.get_history import get_latest_messages, get_long_term_context, get_ful
 from data.import_data import insert_message, get_conn
 from data.embed_messages import embedder
 from collections import defaultdict
+import json
 
+def log_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    print("".join(traceback.format_exception(exc_type, exc_value, exc_traceback)), flush=True)
 
+sys.excepthook = log_exception
+
+def to_serializable(obj):
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {k: to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [to_serializable(v) for v in obj]
+    if hasattr(obj, "model_name"):
+        return getattr(obj, "model_name")
+    if hasattr(obj, "model"):
+        m = getattr(obj, "model")
+        if isinstance(m, (str, int, float, bool)) or m is None:
+            return m
+        return str(m)
+    # fallback to string
+    try:
+        return str(obj)
+    except Exception:
+        return f"<unserializable:{type(obj).__name__}>"
 try:
     from utils.jwt_helper import verify_whoisme_token
 except Exception:
@@ -287,9 +314,11 @@ def chat():
 # ---------------- WHOISME /v1/chat ----------------
 @whoisme_bp.route("/v1/chat", methods=["POST"])
 def whoisme_chat():
+    t0 = time.perf_counter()
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return jsonify({"error": "Missing or invalid Authorization header"}), 401
+
     token = auth_header.split(" ")[1]
     user_info = verify_whoisme_token(token)
     if not user_info:
@@ -299,51 +328,104 @@ def whoisme_chat():
     payload = request.json or {}
     user_msg = payload.get("message", "").strip()
     session_id = payload.get("session_id")
+
     if not user_msg:
         return jsonify({"error": "Message không được để trống"}), 400
 
+    t1 = time.perf_counter()
+    auth_elapsed = round(t1 - t0, 3)
+
+    cache_start = time.perf_counter()
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
+    cache_elapsed = round(time.perf_counter() - cache_start, 3)
+
     if cached_resp:
-        return jsonify({
+        total_elapsed = round(time.perf_counter() - t0, 3)
+        print(f"[CACHE HIT] user_id={user_id}, session={session_id}, total={total_elapsed}s", flush=True)
+        payload = {
             "user_id": user_id,
             "session_id": session_id,
+            "model": "cache",
+            "elapsed": {
+                "total": total_elapsed,
+                "auth": auth_elapsed,
+                "cache": cache_elapsed,
+                "cached": True
+            },
             "message": [
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": cached_resp}
             ]
-        })
+        }
+        return Response(json.dumps(to_serializable(payload)), mimetype="application/json")
 
+    prompt_start = time.perf_counter()
     llm = load_prompt_config()
     if not llm:
         return jsonify({"error": "Model không hợp lệ"}), 400
 
-    # Không thêm user message vào short-term ngay — cập nhật sau khi có buffer (reply)
+    model_name = getattr(llm, "model", None) or getattr(llm, "model_name", "Unknown")
+    print(f"[MODEL USED] {model_name}", flush=True)
+
+    prompt_elapsed = round(time.perf_counter() - prompt_start, 3)
+
+    prepare_start = time.perf_counter()
     short_msgs = get_short_term(user_id, session_id, limit=10)
     long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=5)
     messages = build_structured_prompt(user_msg, short_msgs, long_ctx)
+    prepare_elapsed = round(time.perf_counter() - prepare_start, 3)
 
+    model_start = time.perf_counter()
     buffer = ""
-    for chunk in llm.stream(messages):
-        content = getattr(chunk, "content", "")
-        if content:
-            buffer += content
+    try:
+        for chunk in llm.stream(messages):
+            content = getattr(chunk, "content", "")
+            if content:
+                buffer += content
+    except Exception as e:
+        print(f"[MODEL ERROR] {e}", flush=True)
+        return jsonify({"error": f"Lỗi khi gọi model: {e}"}), 500
 
-    # cập nhật cache short-term với reply vừa tạo
+    model_elapsed = round(time.perf_counter() - model_start, 3)
+
+    update_start = time.perf_counter()
     try:
         get_short_term(user_id, session_id, limit=10, new_message=user_msg, new_reply=buffer)
     except Exception:
         pass
-    async_embed_message(user_id, user_msg, buffer, session_id=session_id)
-    RESPONSE_CACHE.set(user_id, session_id, user_msg, buffer)
 
-    return jsonify({
+    async_embed_message(user_id, user_msg, buffer, session_id=session_id, time_spent=model_elapsed)
+    RESPONSE_CACHE.set(user_id, session_id, user_msg, buffer)
+    update_elapsed = round(time.perf_counter() - update_start, 3)
+
+    total_elapsed = round(time.perf_counter() - t0, 3)
+    print(
+        f"[PROFILE] model={model_name} | total={total_elapsed}s | "
+        f"auth={auth_elapsed}s | cache={cache_elapsed}s | prompt={prompt_elapsed}s | "
+        f"prepare={prepare_elapsed}s | model={model_elapsed}s | update={update_elapsed}s",
+        flush=True
+    )
+
+    payload = {
         "user_id": user_id,
         "session_id": session_id,
+        "model": model_name,
+        "elapsed": {
+            "total": total_elapsed,
+            "auth": auth_elapsed,
+            "cache": cache_elapsed,
+            "prompt": prompt_elapsed,
+            "prepare": prepare_elapsed,
+            "model": model_elapsed,
+            "update": update_elapsed,
+            "cached": False
+        },
         "message": [
             {"role": "user", "content": user_msg},
             {"role": "assistant", "content": buffer}
         ]
-    })
+    }
+    return Response(json.dumps(to_serializable(payload)), mimetype="application/json")
 
 #=========API to hide chat history (soft delete)==========
 @whoisme_bp.route("/v1/hidden", methods=["POST"])

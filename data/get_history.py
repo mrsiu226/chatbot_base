@@ -11,15 +11,9 @@ from data.embed_messages import embedder
 load_dotenv()
 LOCAL_DB_URL = os.getenv("POSTGRES_URL")
 
-# -----------------------------
-# Kết nối DB
-# -----------------------------
 def get_conn():
     return psycopg2.connect(LOCAL_DB_URL, cursor_factory=RealDictCursor)
 
-# -----------------------------
-# Short-term context cache
-# -----------------------------
 short_term_cache = TTLCache(maxsize=5000, ttl=300)  # 5 phút
 
 def get_latest_messages(user_id, session_id=None, limit=10):
@@ -52,9 +46,6 @@ def get_latest_messages(user_id, session_id=None, limit=10):
         print(f"[get_latest_messages] Lỗi: {e}")
         return []
 
-# -----------------------------
-# Long-term context cache (RAG)
-# -----------------------------
 rag_cache = TTLCache(maxsize=2000, ttl=300)
 
 def to_float_array(vec):
@@ -168,9 +159,6 @@ def get_full_history(user_id: str, session_id: str):
         print(f"[get_full_history] Lỗi PostgreSQL: {e}")
         return []
 
-# -----------------------------
-# Test nhanh
-# -----------------------------
 if __name__ == "__main__":
     uid = "1000000405"
     sess = "test-session-001"
