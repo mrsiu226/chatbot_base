@@ -10,6 +10,10 @@ from data.import_data import insert_message, get_conn
 from data.embed_messages import embedder
 from collections import defaultdict
 import json
+import threading
+import hashlib
+import numpy as np
+
 
 def log_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
@@ -188,14 +192,45 @@ def get_short_term(user_id, session_id=None, limit=5, new_message=None, new_repl
     return messages
 
 def get_long_term(user_id, query, session_id=None, top_k=3):
-    key = f"{user_id}_{session_id or 'global'}_{query}"
+    query_hash = hashlib.md5(query.encode('utf-8')).hexdigest()[:12]
+    key = f"{user_id}_{session_id or 'global'}_{query_hash}"
+
     if key in LONG_TERM_CACHE:
         print(f"[CACHE HIT] long_term: {key}")
         return LONG_TERM_CACHE[key]
+
     print(f"[CACHE MISS] long_term: {key}")
-    context = get_long_term_context(user_id, query, session_id=session_id, top_k=top_k)
-    LONG_TERM_CACHE[key] = context
-    return context
+
+    candidates = get_long_term_context(user_id, query, session_id=session_id, top_k=top_k)
+    ranked = sorted(
+        candidates,
+        key=lambda x: 0.7 * x["similarity"] + 0.3 * x["recency"],
+        reverse=True
+    )
+    top_contexts = [c["text"] for c in ranked[:top_k]]
+    LONG_TERM_CACHE[key] = top_contexts
+
+    return top_contexts
+
+def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long_top_k=3):
+    results = {"short": None, "long": None}
+
+    def fetch_short():
+        results["short"] = get_short_term(user_id, session_id, limit=short_limit)
+
+    def fetch_long():
+        results["long"] = get_long_term(user_id, user_msg, session_id, top_k=long_top_k)
+
+    # Tạo 2 thread song song
+    t1 = threading.Thread(target=fetch_short)
+    t2 = threading.Thread(target=fetch_long)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    return results["short"], results["long"]
+
 
 def build_structured_prompt(user_msg, short_msgs, long_context, personality=None):
     system_prompt, user_prompt_format = get_cached_prompt()
@@ -256,7 +291,6 @@ def chat():
     if not llm:
         return Response("Model không hợp lệ", status=400)
     
-    # Lấy short-term hiện tại (không thêm user message lúc này, sẽ cập nhật sau khi có reply)
     short_msgs = get_short_term(user_id, session_id, limit=10)
     long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=5)
     messages = build_structured_prompt(user_msg, short_msgs, long_ctx)
@@ -272,7 +306,6 @@ def chat():
                     buf += content
                     yield content
             elapsed = round(time.perf_counter() - start, 3)
-            # cập nhật short-term cache với trao đổi vừa xảy ra
             try:
                 get_short_term(user_id, session_id, limit=10, new_message=user_msg, new_reply=buf)
             except Exception as _:
@@ -286,8 +319,10 @@ def chat():
 
 # ---------------- WHOISME /v1/chat ----------------
 @whoisme_bp.route("/v1/chat", methods=["POST"])
-def whoisme_chat():
+def whoisme_chat_parallel():
     t0 = time.perf_counter()
+
+    # --- Auth ---
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return jsonify({"error": "Missing or invalid Authorization header"}), 401
@@ -308,14 +343,14 @@ def whoisme_chat():
     t1 = time.perf_counter()
     auth_elapsed = round(t1 - t0, 3)
 
+    # --- Check response cache ---
     cache_start = time.perf_counter()
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
     cache_elapsed = round(time.perf_counter() - cache_start, 3)
 
     if cached_resp:
         total_elapsed = round(time.perf_counter() - t0, 3)
-        print(f"[CACHE HIT] user_id={user_id}, session={session_id}, total={total_elapsed}s", flush=True)
-        payload = {
+        return jsonify({
             "user_id": user_id,
             "session_id": session_id,
             "model": "cache",
@@ -329,25 +364,24 @@ def whoisme_chat():
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": cached_resp}
             ]
-        }
-        return Response(json.dumps(to_serializable(payload)), mimetype="application/json")
+        })
 
+    # --- Load model ---
     prompt_start = time.perf_counter()
     llm = load_prompt_config()
     if not llm:
         return jsonify({"error": "Model không hợp lệ"}), 400
-
     model_name = getattr(llm, "model", None) or getattr(llm, "model_name", "Unknown")
+    prompt_elapsed = round(time.perf_counter() - prompt_start, 3)
     print(f"[MODEL USED] {model_name}", flush=True)
 
-    prompt_elapsed = round(time.perf_counter() - prompt_start, 3)
-
+    # --- Prepare short-term + long-term song song ---
     prepare_start = time.perf_counter()
-    short_msgs = get_short_term(user_id, session_id, limit=10)
-    long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=5)
+    short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=10, long_top_k=5)
     messages = build_structured_prompt(user_msg, short_msgs, long_ctx)
     prepare_elapsed = round(time.perf_counter() - prepare_start, 3)
 
+    # --- Generate response ---
     model_start = time.perf_counter()
     buffer = ""
     try:
@@ -358,19 +392,19 @@ def whoisme_chat():
     except Exception as e:
         print(f"[MODEL ERROR] {e}", flush=True)
         return jsonify({"error": f"Lỗi khi gọi model: {e}"}), 500
-
     model_elapsed = round(time.perf_counter() - model_start, 3)
 
+    # --- Update caches + async DB ---
     update_start = time.perf_counter()
     try:
         get_short_term(user_id, session_id, limit=10, new_message=user_msg, new_reply=buffer)
     except Exception:
         pass
-
     async_embed_message(user_id, user_msg, buffer, session_id=session_id, time_spent=model_elapsed)
     RESPONSE_CACHE.set(user_id, session_id, user_msg, buffer)
     update_elapsed = round(time.perf_counter() - update_start, 3)
 
+    # --- Total elapsed ---
     total_elapsed = round(time.perf_counter() - t0, 3)
     print(
         f"[PROFILE] model={model_name} | total={total_elapsed}s | "
@@ -399,6 +433,9 @@ def whoisme_chat():
         ]
     }
     return Response(json.dumps(to_serializable(payload)), mimetype="application/json")
+
+
+
 
 #=========API to hide chat history (soft delete)==========
 @whoisme_bp.route("/v1/hidden", methods=["POST"])
