@@ -7,6 +7,8 @@ from cachetools import TTLCache
 from functools import lru_cache
 import time
 from data.embed_messages import embedder
+from datetime import datetime
+import math
 
 load_dotenv()
 LOCAL_DB_URL = os.getenv("POSTGRES_URL")
@@ -73,6 +75,7 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
 
     start_total = time.time()
 
+    # --- Embed query ---
     t0 = time.time()
     q_vec = to_float_array(cached_embed_query(query))
     embed_time = time.time() - t0
@@ -87,41 +90,66 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
             t1 = time.time()
             if session_id:
                 cur.execute("""
-                    SELECT id, message, reply,
+                    SELECT id, message, reply, created_at,
                         1 - (embedding_vector <=> %s::vector) AS similarity
                     FROM whoisme.messages
                     WHERE user_id=%s AND session_id=%s
                         AND embedding_vector IS NOT NULL
+                        AND is_deleted = FALSE
                     ORDER BY embedding_vector <=> %s::vector
                     LIMIT %s;
-                """, (q_vec.tolist(), str(user_id), str(session_id), q_vec.tolist(), top_k))
+                """, (q_vec.tolist(), str(user_id), str(session_id), q_vec.tolist(), top_k * 3))
             else:
                 cur.execute("""
-                    SELECT id, message, reply,
+                    SELECT id, message, reply, created_at,
                         1 - (embedding_vector <=> %s::vector) AS similarity
                     FROM whoisme.messages
-                    WHERE user_id=%s AND embedding_vector IS NOT NULL
+                    WHERE user_id=%s 
+                        AND embedding_vector IS NOT NULL
+                        AND is_deleted = FALSE
                     ORDER BY embedding_vector <=> %s::vector
                     LIMIT %s;
-                """, (q_vec.tolist(), str(user_id), q_vec.tolist(), top_k))
+                """, (q_vec.tolist(), str(user_id), q_vec.tolist(), top_k * 3))
 
             rows = cur.fetchall()
             query_time = time.time() - t1
-            total_time = time.time() - start_total
-
-            if debug:
-                print(f"[⏱Embed time] {embed_time:.3f}s")
-                print(f"[⏱Query time] {query_time:.3f}s")
-                print(f"[Total RAG time] {total_time:.3f}s")
-                for r in rows:
-                    print(f"   🔹 {r['id']} → sim={r['similarity']:.3f}")
 
             if not rows:
                 return ""
 
+            now = datetime.utcnow()
+            decay_days = 3  
+
+            def calc_recency_weight(created_at):
+                """Trọng số giảm dần theo thời gian (exponential decay)"""
+                if not created_at:
+                    return 0.5
+                diff_days = (now - created_at).total_seconds() / 86400
+                return math.exp(-diff_days / decay_days)
+
+            reranked = []
+            for r in rows:
+                recency_weight = calc_recency_weight(r["created_at"])
+                final_score = 0.7 * r["similarity"] + 0.3 * recency_weight
+                r["recency_weight"] = recency_weight
+                r["final_score"] = final_score
+                reranked.append(r)
+
+            reranked = sorted(reranked, key=lambda x: x["final_score"], reverse=True)[:top_k]
+
+            if debug:
+                total_time = time.time() - start_total
+                print(f"[⏱Embed time] {embed_time:.3f}s")
+                print(f"[⏱Query time] {query_time:.3f}s")
+                print(f"[Total RAG time] {total_time:.3f}s")
+                print("🔁 Re-ranked context (top_k):")
+                for r in reranked:
+                    print(f"   🔹 {r['id']} | sim={r['similarity']:.3f} | rec={r['recency_weight']:.3f} | final={r['final_score']:.3f}")
+
+            # --- Build context ---
             context_text = "\n".join([
                 f"User: {r['message']}\nBot: {r['reply']}"
-                for r in rows
+                for r in reranked
             ])
 
             rag_cache[cache_key] = context_text
@@ -130,6 +158,7 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
     except Exception as e:
         print(f"[get_long_term_context] Lỗi PostgreSQL: {e}")
         return ""
+
 
 def get_full_history(user_id: str, session_id: str):
     try:
