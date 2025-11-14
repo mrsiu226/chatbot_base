@@ -146,7 +146,6 @@ def index():
 
 @app.route("/health")
 def health_check():
-    """Health check endpoint for monitoring"""
     try:
         # Test database connection
         conn = get_conn()
@@ -271,35 +270,10 @@ def get_long_term(user_id, query, session_id=None, top_k=3, max_chars=300):
     LONG_TERM_CACHE[key] = top_contexts
     return top_contexts
 
-def build_personality_prompt(personality: dict) -> str:
-    if not personality:
-        return ""
-
-    return f"""
-### PERSONALITY CONFIG
-Name: {personality.get("name", "")}
-Color: {personality.get("color", "")}
-Tone: {personality.get("tone", "")}
-Style: {personality.get("style", "")}
-Representative Spirit: {personality.get("representativeSpirit", "")}
-Slogan: {personality.get("slogan", "")}
-Suggested Jobs: {personality.get("suggestedJobs", "")}
-Strengths: {personality.get("strengths", "")}
-Weaknesses: {personality.get("weaknesses", "")}
-Note: {personality.get("note", "")}
-
-### PERSONALITY USAGE RULES
-- Pha nhẹ tone/đặc điểm từ personality khi phù hợp, không gượng ép.
-- Không nhắc lại thông số personality trừ khi người dùng hỏi.
-- Giọng nói ưu tiên tự nhiên, dùng personality để tạo sắc thái chứ không phải nội dung.
-"""
-
 def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long_top_k=3, max_long_chars=300):
     results = {"short": [], "long": []}
-
     def fetch_short():
         results["short"] = get_short_term(user_id, session_id, limit=short_limit)
-
     def fetch_long():
         raw_long = get_long_term(user_id, user_msg, session_id=session_id, top_k=long_top_k)
         results["long"] = [c[:max_long_chars].strip() for c in raw_long if c.strip()]
@@ -310,19 +284,52 @@ def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long
     t2.start()
     t1.join()
     t2.join()
-
     return results["short"], results["long"]
 
+import re
 
-def build_structured_prompt(user_msg, short_msgs, long_context, personality=None, archetype_code=None, max_long_lines=5):
+def inject_personality(system_prompt: str, personality: dict, userPromptFormat: dict = None) -> str:
+    if not personality and not userPromptFormat:
+        return re.sub(r"%\w+%", "", system_prompt)
+
+    mapping = {
+        "%name%": personality.get("name", ""),
+        "%color%": personality.get("color", ""),
+        "%tone%": personality.get("tone", ""),
+        "%style%": personality.get("style", ""),
+        "%spirit%": personality.get("representativeSpirit", ""),
+        "%slogan%": personality.get("slogan", ""),
+        "%strengths%": personality.get("strengths", ""),
+        "%weaknesses%": personality.get("weaknesses", ""),
+        "%suggestedJobs%": personality.get("suggestedJobs", ""),
+        "%note%": personality.get("note", ""),
+    }
+
+    if userPromptFormat:
+        for key, value in userPromptFormat.items():
+            placeholder = f"%{key}%"
+            mapping[placeholder] = value
+
+    for k, v in mapping.items():
+        system_prompt = system_prompt.replace(k, v or "")
+
+    system_prompt = re.sub(r"%\w+%", "", system_prompt)
+
+    return system_prompt
+
+
+def build_structured_prompt(
+    user_msg,
+    short_msgs,
+    long_context,
+    archetype_code=None,
+    max_long_lines=5
+):
     system_prompt, user_prompt_format = get_cached_prompt()
 
     personality = fetch_personality_source(archetype_code) if archetype_code else {}
+    final_system_prompt = inject_personality(system_prompt or "", personality).strip()
 
-    personality_block = build_personality_prompt(personality or {})
-    final_system_prompt = (system_prompt or "").strip()
-    if personality_block:
-        final_system_prompt += "\n\n" + personality_block.strip()
     messages = [{"role": "system", "content": final_system_prompt}]
 
     for m in short_msgs:
@@ -339,10 +346,10 @@ def build_structured_prompt(user_msg, short_msgs, long_context, personality=None
             "role": "system",
             "content": "LONG-TERM CONTEXT:\n" + "\n".join([c.strip() for c in long_snippets])
         })
-
-    formatted_user_msg = (user_prompt_format or "User said: {{content}}").replace("{{content}}", user_msg.strip())
+    formatted_user_msg = (user_prompt_format or "User said: {{content}}").replace(
+        "{{content}}", user_msg.strip()
+    )
     messages.append({"role": "user", "content": formatted_user_msg})
-
     return messages
 
 # ---------------- ASYNC DB ----------------
@@ -382,7 +389,7 @@ def chat():
     
     short_msgs = get_short_term(user_id, session_id, limit=10)
     long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=5)
-    messages = build_structured_prompt(user_msg, short_msgs, long_ctx, personality=None, archetype_code=archetype_code)
+    messages = build_structured_prompt(user_msg, short_msgs, long_ctx, archetype_code=archetype_code)
 
     @stream_with_context
     def generate():
@@ -470,7 +477,7 @@ def whoisme_chat_parallel():
 
     prepare_start = time.perf_counter()
     short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=10, long_top_k=5)
-    messages = build_structured_prompt(user_msg, short_msgs, long_ctx, personality=None, archetype_code=archetype_code)
+    messages = build_structured_prompt(user_msg, short_msgs, long_ctx, archetype_code=archetype_code)
     prepare_elapsed = round(time.perf_counter() - prepare_start, 3)
 
     model_start = time.perf_counter()
@@ -523,6 +530,120 @@ def whoisme_chat_parallel():
             {"role": "assistant", "content": buffer}
         ]
     }
+    return Response(json.dumps(to_serializable(payload_out)), mimetype="application/json")
+
+#=========v2=================
+@whoisme_bp.route("/v1/chatbot", methods=["POST"])
+def whoisme_chat_parallell():
+    t0 = time.perf_counter()
+
+    print("==== REQUEST START ====", flush=True)
+    print(f"Path: {request.path}", flush=True)
+    print(f"Method: {request.method}", flush=True)
+    print(f"Headers: {dict(request.headers)}", flush=True)
+    try:
+        payload = request.get_json(force=True)
+    except Exception as e:
+        payload = {}
+        print(f"[ERROR] parsing JSON payload: {e}", flush=True)
+    print(f"Payload: {json.dumps(payload, ensure_ascii=False)}", flush=True)
+    print("==== REQUEST END ====", flush=True)
+
+    # ---- Authentication ----
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        print("[AUTH ERROR] Missing or invalid Authorization header", flush=True)
+        return jsonify({"error": "Missing or invalid Authorization header"}), 401
+
+    token = auth_header.split(" ")[1]
+    user_info = verify_whoisme_token(token)
+    if not user_info:
+        print("[AUTH ERROR] Invalid token", flush=True)
+        return jsonify({"error": "Invalid WhoIsMe token"}), 401
+
+    user_id = user_info["userId"]
+    user_msg = (payload.get("message") or "").strip()
+    session_id = payload.get("session_id")
+    archetype_code = payload.get("code")
+
+    print(f"[INFO] user_id={user_id}, session_id={session_id}, archetype_code={archetype_code}", flush=True)
+    print(f"[INFO] user_msg: {user_msg}", flush=True)
+
+    if not user_msg:
+        return jsonify({"error": "Message không được để trống"}), 400
+
+    # ---- Cache ----
+    cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
+    if cached_resp:
+        print(f"[CACHE HIT] {cached_resp}", flush=True)
+        payload_out = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "model": "cache",
+            "archetype_code": archetype_code,
+            "cached": True,
+            "message": [
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": cached_resp}
+            ]
+        }
+        print("==== RESPONSE ====", flush=True)
+        print(json.dumps(payload_out, ensure_ascii=False, indent=2), flush=True)
+        print("==== END RESPONSE ====", flush=True)
+        return jsonify(payload_out)
+
+    # ---- Load model ----
+    llm = load_prompt_config()
+    if not llm:
+        return jsonify({"error": "Model không hợp lệ"}), 400
+
+    # ---- Build context ----
+    short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=10, long_top_k=5)
+    messages = build_structured_prompt(user_msg, short_msgs, long_ctx, archetype_code=archetype_code)
+    print("[CONTEXT] Short messages:", flush=True)
+    print(short_msgs, flush=True)
+    print("[CONTEXT] Long messages:", flush=True)
+    print(long_ctx, flush=True)
+    print("[PROMPT] Full structured prompt:", flush=True)
+    print(json.dumps(messages, ensure_ascii=False, indent=2), flush=True)
+
+    # ---- Call model ----
+    buffer = ""
+    try:
+        for chunk in llm.stream(messages):
+            content = getattr(chunk, "content", "")
+            if content:
+                buffer += content
+    except Exception as e:
+        print(f"[MODEL ERROR] {e}", flush=True)
+        return jsonify({"error": f"Lỗi khi gọi model: {e}"}), 500
+
+    # ---- Update caches and DB ----
+    try:
+        get_short_term(user_id, session_id, limit=10, new_message=user_msg, new_reply=buffer)
+    except Exception:
+        pass
+    async_embed_message(user_id, user_msg, buffer, session_id=session_id)
+    RESPONSE_CACHE.set(user_id, session_id, user_msg, buffer)
+
+    # ---- Full response log ----
+    payload_out = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "model": getattr(llm, "model", getattr(llm, "model_name", "Unknown")),
+        "archetype_code": archetype_code,
+        "cached": False,
+        "prompt": messages,
+        "message": [
+            {"role": "user", "content": user_msg},
+            {"role": "assistant", "content": buffer}
+        ]
+    }
+
+    print("==== RESPONSE ====", flush=True)
+    print(json.dumps(to_serializable(payload_out), ensure_ascii=False, indent=2), flush=True)
+    print("==== END RESPONSE ====", flush=True)
+
     return Response(json.dumps(to_serializable(payload_out)), mimetype="application/json")
 
 #=========API to hide chat history (soft delete)==========
