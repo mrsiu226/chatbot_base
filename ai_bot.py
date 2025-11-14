@@ -1,4 +1,3 @@
-# whoisme_app.py  (thay thế file cũ bằng file này)
 import os, sys, re, time, requests, traceback
 from flask import Flask, request, Response, stream_with_context, session, redirect, jsonify, Blueprint
 from dotenv import load_dotenv
@@ -518,6 +517,7 @@ def whoisme_chat_parallel():
             "update": update_elapsed,
             "cached": False
         },
+        "prompt": messages,
         "message": [
             {"role": "user", "content": user_msg},
             {"role": "assistant", "content": buffer}
