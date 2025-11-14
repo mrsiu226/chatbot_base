@@ -29,7 +29,9 @@ def get_latest_messages(user_id, session_id=None, limit=10):
                 cur.execute("""
                     SELECT id, message, reply, created_at, session_id
                     FROM whoisme.messages
-                    WHERE user_id = %s AND session_id = %s AND is_deleted = FALSE
+                    WHERE user_id = %s 
+                        AND session_id = %s 
+                        AND is_deleted = FALSE
                     ORDER BY created_at DESC
                     LIMIT %s;
                 """, (str(user_id), str(session_id), limit))
@@ -37,7 +39,8 @@ def get_latest_messages(user_id, session_id=None, limit=10):
                 cur.execute("""
                     SELECT id, message, reply, created_at, session_id
                     FROM whoisme.messages
-                    WHERE user_id = %s AND is_deleted = FALSE
+                    WHERE user_id = %s 
+                        AND is_deleted = FALSE
                     ORDER BY created_at DESC
                     LIMIT %s;
                 """, (str(user_id), limit))
@@ -75,14 +78,13 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
 
     start_total = time.time()
 
-    # --- Embed query ---
     t0 = time.time()
     q_vec = to_float_array(cached_embed_query(query))
     embed_time = time.time() - t0
 
     if q_vec is None:
         if debug:
-            print("[get_long_term_context] ⚠️ Không tạo được vector query")
+            print("[get_long_term_context] Không tạo được vector query")
         return ""
 
     try:
@@ -93,7 +95,8 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
                     SELECT id, message, reply, created_at,
                         1 - (embedding_vector <=> %s::vector) AS similarity
                     FROM whoisme.messages
-                    WHERE user_id=%s AND session_id=%s
+                    WHERE user_id=%s 
+                        AND session_id=%s
                         AND embedding_vector IS NOT NULL
                         AND is_deleted = FALSE
                     ORDER BY embedding_vector <=> %s::vector
@@ -121,7 +124,6 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
             decay_days = 3  
 
             def calc_recency_weight(created_at):
-                """Trọng số giảm dần theo thời gian (exponential decay)"""
                 if not created_at:
                     return 0.5
                 diff_days = (now - created_at).total_seconds() / 86400
@@ -139,14 +141,13 @@ def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int 
 
             if debug:
                 total_time = time.time() - start_total
-                print(f"[⏱Embed time] {embed_time:.3f}s")
-                print(f"[⏱Query time] {query_time:.3f}s")
+                print(f"[Embed time] {embed_time:.3f}s")
+                print(f"[Query time] {query_time:.3f}s")
                 print(f"[Total RAG time] {total_time:.3f}s")
-                print("🔁 Re-ranked context (top_k):")
+                print("Re-ranked context (top_k):")
                 for r in reranked:
                     print(f"   🔹 {r['id']} | sim={r['similarity']:.3f} | rec={r['recency_weight']:.3f} | final={r['final_score']:.3f}")
 
-            # --- Build context ---
             context_text = "\n".join([
                 f"User: {r['message']}\nBot: {r['reply']}"
                 for r in reranked

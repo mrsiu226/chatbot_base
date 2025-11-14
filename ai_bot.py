@@ -9,9 +9,10 @@ from data.get_history import get_latest_messages, get_long_term_context, get_ful
 from data.import_data import insert_message, get_conn
 from data.embed_messages import embedder
 from collections import defaultdict
-import json
+import json, logging
 import threading
 import hashlib
+from collections import deque
 import numpy as np
 
 
@@ -37,7 +38,6 @@ def to_serializable(obj):
         if isinstance(m, (str, int, float, bool)) or m is None:
             return m
         return str(m)
-    # fallback to string
     try:
         return str(obj)
     except Exception:
@@ -71,8 +71,44 @@ SHORT_TERM_CACHE = TTLCache(maxsize=5000, ttl=1800)
 LONG_TERM_CACHE = TTLCache(maxsize=5000, ttl=900)   
 PROMPT_CACHE = {"systemPrompt": "", "userPromptFormat": "", "updatedAt": None, "timestamp": 0}
 
+logger = logging.getLogger(__name__)
+PERSIONALITY_CACHE = {"data": {}, "updatedAt": None, "lock": threading.Lock()}
+WHOISME_API_URL = "https://api.whoisme.ai/api/archetype/code/{}"
+
+def fetch_personality_source(archetype_code: str)->dict:
+    try:
+        resp = requests.get(WHOISME_API_URL.format(archetype_code), timeout=5)
+        resp.raise_for_status()
+        data = resp.json().get("data") or resp.json()
+        translation = data.get("translation") or {}
+        updated_at = data.get("updatedAt") or data.get("updated_at")
+
+        with PERSIONALITY_CACHE["lock"]:
+            if PERSIONALITY_CACHE["updatedAt"] != updated_at:
+                persionality = {
+                    "name": translation.get("name") or "",
+                    "color": translation.get("color") or "",
+                    "tone": translation.get("tone") or "",
+                    "style": translation.get("style") or "",
+                    "representativeSpirit": translation.get("representativeSpirit") or "",
+                    "slogan": translation.get("slogan") or "",
+                    "suggestedJobs": translation.get("suggestedJobs") or "",
+                    "strengths": translation.get("strengths") or "",
+                    "weaknesses": translation.get("weaknesses") or "",
+                    "note": translation.get("note") or "",
+                }
+                PERSIONALITY_CACHE["data"] = persionality
+                PERSIONALITY_CACHE["updatedAt"] = updated_at
+                logger.info(f"[PERSIONALITY_CACHE] Updated for {archetype_code} at {updated_at}")
+            else:
+                persionality = PERSIONALITY_CACHE["data"]
+            
+        return persionality
+    except Exception as e:
+        logger.error(f"[fetch_personality_source] Error fetching personality: {e}")
+        return PERSIONALITY_CACHE.get("data") or {}
+
 #-----------------RESPONSE CACHE----------------
-# Response cache (tránh lặp câu quá nhanh)
 class ResponseCache:
     def __init__(self, ttl=120, max_hits=1):
         self.cache = TTLCache(maxsize=5000, ttl=ttl)
@@ -176,52 +212,75 @@ def get_cached_prompt():
 # ---------------- CONTEXT HELPERS ----------------
 def get_short_term(user_id, session_id=None, limit=5, new_message=None, new_reply=None):
     key = f"{user_id}_{session_id or 'global'}"
-    if key in SHORT_TERM_CACHE:
-        messages = SHORT_TERM_CACHE[key]
-        print(f"[CACHE HIT] short_term: {key}")
+    if key not in SHORT_TERM_CACHE:
+        messages = deque(get_latest_messages(user_id, session_id, limit), maxlen=limit)
+        SHORT_TERM_CACHE[key] = messages
     else:
-        print(f"[CACHE MISS] short_term: {key}")
-        messages = get_latest_messages(user_id, session_id, limit)
-        SHORT_TERM_CACHE[key] = messages
-    if new_message is not None and new_reply is not None:
-        messages.append({"message": new_message, "reply": new_reply})
-        if len(messages) > limit:
-            messages = messages[-limit:]
-        SHORT_TERM_CACHE[key] = messages
-        print(f"[SHORT_TERM_CACHE UPDATED] {key} (total={len(messages)})")
-    return messages
+        messages = SHORT_TERM_CACHE[key]
 
-def get_long_term(user_id, query, session_id=None, top_k=3):
-    query_hash = hashlib.md5(query.encode('utf-8')).hexdigest()[:12]
+    if new_message and new_reply:
+        messages.append({"message": new_message.strip(), "reply": new_reply.strip()})
+
+    return list(messages)
+
+def get_long_term(user_id, query, session_id=None, top_k=3, max_chars=300):
+    query_hash = hashlib.md5(query.encode("utf-8")).hexdigest()
     key = f"{user_id}_{session_id or 'global'}_{query_hash}"
 
     if key in LONG_TERM_CACHE:
         print(f"[CACHE HIT] long_term: {key}")
         return LONG_TERM_CACHE[key]
-
+    
     print(f"[CACHE MISS] long_term: {key}")
+    candidates = get_long_term_context(user_id, query, session_id=session_id, top_k=top_k) or []
 
-    candidates = get_long_term_context(user_id, query, session_id=session_id, top_k=top_k)
     ranked = sorted(
         candidates,
-        key=lambda x: 0.7 * x["similarity"] + 0.3 * x["recency"],
+        key=lambda x: 0.7 * x.get("similarity", 0) + 0.3 * x.get("recency", 0),
         reverse=True
     )
-    top_contexts = [c["text"] for c in ranked[:top_k]]
+    top_contexts = [c.get("text", "").strip()[:max_chars] for c in ranked[:top_k] if c.get("text")]
     LONG_TERM_CACHE[key] = top_contexts
-
     return top_contexts
 
-def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long_top_k=3):
-    results = {"short": None, "long": None}
+def build_personality_prompt(personality: dict) -> str:
+    if not personality:
+        return ""
+
+    return f"""
+### PERSONALITY CONFIG
+Name: {personality.get("name", "")}
+Color: {personality.get("color", "")}
+Tone: {personality.get("tone", "")}
+Style: {personality.get("style", "")}
+Representative Spirit: {personality.get("representativeSpirit", "")}
+Slogan: {personality.get("slogan", "")}
+Suggested Jobs: {personality.get("suggestedJobs", "")}
+Strengths: {personality.get("strengths", "")}
+Weaknesses: {personality.get("weaknesses", "")}
+Note: {personality.get("note", "")}
+
+### PERSONALITY USAGE RULES
+- Pha nhẹ tone/đặc điểm từ personality khi phù hợp, không gượng ép.
+- Không nhắc lại thông số personality trừ khi người dùng hỏi.
+- Giọng nói ưu tiên tự nhiên, dùng personality để tạo sắc thái chứ không phải nội dung.
+"""
+
+def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long_top_k=3, max_long_chars=300):
+    """
+    Lấy context song song:
+    - short_term: short_limit message gần nhất
+    - long_term: top_k context đã rank, truncate max_long_chars
+    """
+    results = {"short": [], "long": []}
 
     def fetch_short():
         results["short"] = get_short_term(user_id, session_id, limit=short_limit)
 
     def fetch_long():
-        results["long"] = get_long_term(user_id, user_msg, session_id, top_k=long_top_k)
+        raw_long = get_long_term(user_id, user_msg, session_id=session_id, top_k=long_top_k)
+        results["long"] = [c[:max_long_chars].strip() for c in raw_long if c.strip()]
 
-    # Tạo 2 thread song song
     t1 = threading.Thread(target=fetch_short)
     t2 = threading.Thread(target=fetch_long)
     t1.start()
@@ -232,29 +291,31 @@ def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long
     return results["short"], results["long"]
 
 
-def build_structured_prompt(user_msg, short_msgs, long_context, personality=None):
+def build_structured_prompt(user_msg, short_msgs, long_context, personality=None, max_long_lines=5):
     system_prompt, user_prompt_format = get_cached_prompt()
-    if personality:
-        for k, v in personality.items():
-            system_prompt = system_prompt.replace(f"%{k}%", str(v))
-            user_prompt_format = user_prompt_format.replace(f"%{k}%", str(v))
-    else:
-        system_prompt = re.sub(r"%\w+%", "", system_prompt)
-        user_prompt_format = re.sub(r"%\w+%", "", user_prompt_format)
+    if personality is None:
+        archetype = session.get("archetype") or "INTP1"
+        personality = fetch_personality_source(archetype)
 
-    # Structured messages
-    messages = [{"role": "system", "content": system_prompt}]
-    # Short-term history
+    personality_block = build_personality_prompt(personality)
+    final_system_prompt = system_prompt.strip() + "\n\n" + personality_block.strip()
+    messages = [{"role": "system", "content": final_system_prompt}]
+
     for m in short_msgs:
-        messages.append({"role": "user", "content": m["message"]})
-        messages.append({"role": "assistant", "content": m["reply"]})
-    # Long-term context
-    if long_context:
-        messages.append({"role": "system", "content": long_context})
-    # Current message
-    messages.append({"role": "user", "content": user_msg})
-    return messages
+        messages.append({"role": "user", "content": m["message"].strip()})
+        messages.append({"role": "assistant", "content": m["reply"].strip()})
 
+    if long_context:
+        long_snippets = long_context[:max_long_lines]
+        messages.append({
+            "role": "system",
+            "content": "LONG-TERM CONTEXT:\n" + "\n".join([c.strip() for c in long_snippets])
+        })
+
+    formatted_user_msg = user_prompt_format.replace("{{content}}", user_msg.strip())
+    messages.append({"role": "user", "content": formatted_user_msg})
+
+    return messages
 
 # ---------------- ASYNC DB ----------------
 def async_embed_message(user_id, message, reply, session_id=None, time_spent=None):
@@ -275,7 +336,6 @@ def chat():
     user_id = session["user"]["id"]
     session_id = data.get("session_id")
 
-    # Response cache
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
     if cached_resp:
         return jsonify({
@@ -322,7 +382,6 @@ def chat():
 def whoisme_chat_parallel():
     t0 = time.perf_counter()
 
-    # --- Auth ---
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return jsonify({"error": "Missing or invalid Authorization header"}), 401
@@ -343,7 +402,6 @@ def whoisme_chat_parallel():
     t1 = time.perf_counter()
     auth_elapsed = round(t1 - t0, 3)
 
-    # --- Check response cache ---
     cache_start = time.perf_counter()
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
     cache_elapsed = round(time.perf_counter() - cache_start, 3)
@@ -366,7 +424,6 @@ def whoisme_chat_parallel():
             ]
         })
 
-    # --- Load model ---
     prompt_start = time.perf_counter()
     llm = load_prompt_config()
     if not llm:
@@ -375,13 +432,11 @@ def whoisme_chat_parallel():
     prompt_elapsed = round(time.perf_counter() - prompt_start, 3)
     print(f"[MODEL USED] {model_name}", flush=True)
 
-    # --- Prepare short-term + long-term song song ---
     prepare_start = time.perf_counter()
     short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=10, long_top_k=5)
     messages = build_structured_prompt(user_msg, short_msgs, long_ctx)
     prepare_elapsed = round(time.perf_counter() - prepare_start, 3)
 
-    # --- Generate response ---
     model_start = time.perf_counter()
     buffer = ""
     try:
@@ -394,7 +449,6 @@ def whoisme_chat_parallel():
         return jsonify({"error": f"Lỗi khi gọi model: {e}"}), 500
     model_elapsed = round(time.perf_counter() - model_start, 3)
 
-    # --- Update caches + async DB ---
     update_start = time.perf_counter()
     try:
         get_short_term(user_id, session_id, limit=10, new_message=user_msg, new_reply=buffer)
@@ -404,7 +458,6 @@ def whoisme_chat_parallel():
     RESPONSE_CACHE.set(user_id, session_id, user_msg, buffer)
     update_elapsed = round(time.perf_counter() - update_start, 3)
 
-    # --- Total elapsed ---
     total_elapsed = round(time.perf_counter() - t0, 3)
     print(
         f"[PROFILE] model={model_name} | total={total_elapsed}s | "
@@ -433,9 +486,6 @@ def whoisme_chat_parallel():
         ]
     }
     return Response(json.dumps(to_serializable(payload)), mimetype="application/json")
-
-
-
 
 #=========API to hide chat history (soft delete)==========
 @whoisme_bp.route("/v1/hidden", methods=["POST"])
