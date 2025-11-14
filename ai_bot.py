@@ -1,4 +1,5 @@
-import os, sys, re, time, threading, requests, traceback
+# whoisme_app.py  (thay thế file cũ bằng file này)
+import os, sys, re, time, requests, traceback
 from flask import Flask, request, Response, stream_with_context, session, redirect, jsonify, Blueprint
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
@@ -8,13 +9,11 @@ from model import load_prompt_config
 from data.get_history import get_latest_messages, get_long_term_context, get_full_history
 from data.import_data import insert_message, get_conn
 from data.embed_messages import embedder
-from collections import defaultdict
+from collections import defaultdict, deque
 import json, logging
 import threading
 import hashlib
-from collections import deque
 import numpy as np
-
 
 def log_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
@@ -42,6 +41,7 @@ def to_serializable(obj):
         return str(obj)
     except Exception:
         return f"<unserializable:{type(obj).__name__}>"
+
 try:
     from utils.jwt_helper import verify_whoisme_token
 except Exception:
@@ -76,6 +76,8 @@ PERSIONALITY_CACHE = {"data": {}, "updatedAt": None, "lock": threading.Lock()}
 WHOISME_API_URL = "https://api.whoisme.ai/api/archetype/code/{}"
 
 def fetch_personality_source(archetype_code: str)->dict:
+    if not archetype_code:
+        return {}
     try:
         resp = requests.get(WHOISME_API_URL.format(archetype_code), timeout=5)
         resp.raise_for_status()
@@ -191,10 +193,10 @@ def background_prompt_updater(interval=300):
     while True:
         try:
             new_data = fetch_prompt_from_api()
-            if new_data["updatedAt"] != PROMPT_CACHE.get("updatedAt"):
+            if new_data.get("updatedAt") != PROMPT_CACHE.get("updatedAt"):
                 PROMPT_CACHE.update(new_data)
                 PROMPT_CACHE["timestamp"] = time.time()
-                print(f"[Prompt Updated] at {new_data['updatedAt']}")
+                print(f"[Prompt Updated] at {new_data.get('updatedAt')}")
         except Exception as e:
             print(f"[Prompt Updater Error]: {e}")
         time.sleep(interval)
@@ -267,11 +269,6 @@ Note: {personality.get("note", "")}
 """
 
 def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long_top_k=3, max_long_chars=300):
-    """
-    Lấy context song song:
-    - short_term: short_limit message gần nhất
-    - long_term: top_k context đã rank, truncate max_long_chars
-    """
     results = {"short": [], "long": []}
 
     def fetch_short():
@@ -291,19 +288,24 @@ def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long
     return results["short"], results["long"]
 
 
-def build_structured_prompt(user_msg, short_msgs, long_context, personality=None, max_long_lines=5):
+def build_structured_prompt(user_msg, short_msgs, long_context, personality=None, archetype_code=None, max_long_lines=5):
     system_prompt, user_prompt_format = get_cached_prompt()
-    if personality is None:
-        archetype = session.get("archetype") or "INTP1"
-        personality = fetch_personality_source(archetype)
 
-    personality_block = build_personality_prompt(personality)
-    final_system_prompt = system_prompt.strip() + "\n\n" + personality_block.strip()
+    personality = fetch_personality_source(archetype_code) if archetype_code else {}
+
+    personality_block = build_personality_prompt(personality or {})
+    final_system_prompt = (system_prompt or "").strip()
+    if personality_block:
+        final_system_prompt += "\n\n" + personality_block.strip()
     messages = [{"role": "system", "content": final_system_prompt}]
 
     for m in short_msgs:
-        messages.append({"role": "user", "content": m["message"].strip()})
-        messages.append({"role": "assistant", "content": m["reply"].strip()})
+        user_msg_short = (m.get("message") or "").strip()
+        reply_short = (m.get("reply") or "").strip()
+        if user_msg_short:
+            messages.append({"role": "user", "content": user_msg_short})
+        if reply_short:
+            messages.append({"role": "assistant", "content": reply_short})
 
     if long_context:
         long_snippets = long_context[:max_long_lines]
@@ -312,7 +314,7 @@ def build_structured_prompt(user_msg, short_msgs, long_context, personality=None
             "content": "LONG-TERM CONTEXT:\n" + "\n".join([c.strip() for c in long_snippets])
         })
 
-    formatted_user_msg = user_prompt_format.replace("{{content}}", user_msg.strip())
+    formatted_user_msg = (user_prompt_format or "User said: {{content}}").replace("{{content}}", user_msg.strip())
     messages.append({"role": "user", "content": formatted_user_msg})
 
     return messages
@@ -335,6 +337,7 @@ def chat():
         return Response("Message không được để trống", status=400)
     user_id = session["user"]["id"]
     session_id = data.get("session_id")
+    archetype_code = data.get("code")  # UI may send archetype in field "code"
 
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
     if cached_resp:
@@ -353,7 +356,7 @@ def chat():
     
     short_msgs = get_short_term(user_id, session_id, limit=10)
     long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=5)
-    messages = build_structured_prompt(user_msg, short_msgs, long_ctx)
+    messages = build_structured_prompt(user_msg, short_msgs, long_ctx, personality=None, archetype_code=archetype_code)
 
     @stream_with_context
     def generate():
@@ -368,7 +371,7 @@ def chat():
             elapsed = round(time.perf_counter() - start, 3)
             try:
                 get_short_term(user_id, session_id, limit=10, new_message=user_msg, new_reply=buf)
-            except Exception as _:
+            except Exception:
                 pass
             async_embed_message(user_id, user_msg, buf, session_id=session_id, time_spent=elapsed)
             RESPONSE_CACHE.set(user_id, session_id, user_msg, buf)
@@ -392,9 +395,15 @@ def whoisme_chat_parallel():
         return jsonify({"error": "Invalid WhoIsMe token"}), 401
 
     user_id = user_info["userId"]
-    payload = request.json or {}
-    user_msg = payload.get("message", "").strip()
+    payload = request.get_json(force=True, silent=True) or {}
+
+    user_msg = (payload.get("message") or "").strip()
     session_id = payload.get("session_id")
+
+    code_raw = payload.get("code")
+    archetype_code = code_raw.strip() if isinstance(code_raw, str) and code_raw.strip() else None
+
+
 
     if not user_msg:
         return jsonify({"error": "Message không được để trống"}), 400
@@ -412,6 +421,7 @@ def whoisme_chat_parallel():
             "user_id": user_id,
             "session_id": session_id,
             "model": "cache",
+            "archetype_code": archetype_code,
             "elapsed": {
                 "total": total_elapsed,
                 "auth": auth_elapsed,
@@ -434,7 +444,7 @@ def whoisme_chat_parallel():
 
     prepare_start = time.perf_counter()
     short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=10, long_top_k=5)
-    messages = build_structured_prompt(user_msg, short_msgs, long_ctx)
+    messages = build_structured_prompt(user_msg, short_msgs, long_ctx, personality=None, archetype_code=archetype_code)
     prepare_elapsed = round(time.perf_counter() - prepare_start, 3)
 
     model_start = time.perf_counter()
@@ -466,10 +476,11 @@ def whoisme_chat_parallel():
         flush=True
     )
 
-    payload = {
+    payload_out = {
         "user_id": user_id,
         "session_id": session_id,
         "model": model_name,
+        "archetype_code": archetype_code,
         "elapsed": {
             "total": total_elapsed,
             "auth": auth_elapsed,
@@ -485,7 +496,7 @@ def whoisme_chat_parallel():
             {"role": "assistant", "content": buffer}
         ]
     }
-    return Response(json.dumps(to_serializable(payload)), mimetype="application/json")
+    return Response(json.dumps(to_serializable(payload_out)), mimetype="application/json")
 
 #=========API to hide chat history (soft delete)==========
 @whoisme_bp.route("/v1/hidden", methods=["POST"])
@@ -533,7 +544,10 @@ def whoisme_history():
         return jsonify({"error": "Invalid WhoIsMe token"}), 401
 
     user_id = user_info.get("userId")
-    session_id = (request.args.get("session_id") or request.json.get("session_id")) if request.is_json else None
+
+    # Lấy session_id từ query string hoặc JSON body (an toàn)
+    body = request.get_json(silent=True) or {}
+    session_id = request.args.get("session_id") or body.get("session_id")
     if not session_id:
         return jsonify({"error": "Thiếu session_id"}), 400
 
@@ -608,7 +622,7 @@ def whoisme_sessions():
                     rec["last_time"].isoformat() if hasattr(rec["last_time"], "isoformat") else str(rec["last_time"])
                 )
                 rec["total_messages"] = int(rec.get("total_messages") or 0)
-                rec["first_message"] = str(rec["first_message"]) if rec.get("first_message") else None
+                rec["first_message"] = str(rec.get("first_message")) if rec.get("first_message") else None
                 sessions.append(rec)
 
         return jsonify({
