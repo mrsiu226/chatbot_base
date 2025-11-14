@@ -1,4 +1,3 @@
-# whoisme_app.py  (thay thế file cũ bằng file này)
 import os, sys, re, time, requests, traceback
 from flask import Flask, request, Response, stream_with_context, session, redirect, jsonify, Blueprint
 from dotenv import load_dotenv
@@ -144,6 +143,33 @@ def index():
     if not session.get("user"):
         return redirect("/login-ui")
     return redirect("/chatbot")
+
+@app.route("/health")
+def health_check():
+    """Health check endpoint for monitoring"""
+    try:
+        # Test database connection
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            "status": "healthy",
+            "service": "chatbot_base",
+            "database": "connected",
+            "timestamp": None
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy", 
+            "service": "chatbot_base",
+            "database": "disconnected",
+            "error": str(e),
+            "timestamp": None
+        }), 500
 
 @app.route("/chatbot")
 def chatbot():
@@ -491,6 +517,7 @@ def whoisme_chat_parallel():
             "update": update_elapsed,
             "cached": False
         },
+        "prompt": messages,
         "message": [
             {"role": "user", "content": user_msg},
             {"role": "assistant", "content": buffer}
