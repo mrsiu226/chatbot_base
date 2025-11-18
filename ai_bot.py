@@ -1,46 +1,65 @@
-import os, sys, re, time, requests, traceback
+import os, sys, re, time, requests, traceback, threading, hashlib, json, logging
 from flask import Flask, request, Response, stream_with_context, session, redirect, jsonify, Blueprint
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 import psycopg2
 from cachetools import TTLCache
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from model import load_prompt_config
 from data.get_history import get_latest_messages, get_long_term_context, get_full_history
 from data.import_data import insert_message, get_conn
 from data.embed_messages import embedder
-from collections import defaultdict, deque
-import json, logging
-import threading
-import hashlib
-import numpy as np
+
+# ---------------- ENV ----------------
+load_dotenv()
+LOCAL_DB_URL = os.getenv("POSTGRES_URL")
+PROMPT_API_URL = "https://prompt.whoisme.ai/api/public/prompt/chatgpt_prompt_chatbot"
+WHOISME_API_URL = "https://api.whoisme.ai/api/archetype/code/{}"
+
+# ---------------- LOGGER ----------------
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 def log_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
     print("".join(traceback.format_exception(exc_type, exc_value, exc_traceback)), flush=True)
-
 sys.excepthook = log_exception
 
-def to_serializable(obj):
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-    if isinstance(obj, dict):
-        return {k: to_serializable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [to_serializable(v) for v in obj]
-    if hasattr(obj, "model_name"):
-        return getattr(obj, "model_name")
-    if hasattr(obj, "model"):
-        m = getattr(obj, "model")
-        if isinstance(m, (str, int, float, bool)) or m is None:
-            return m
-        return str(m)
-    try:
-        return str(obj)
-    except Exception:
-        return f"<unserializable:{type(obj).__name__}>"
+# ---------------- FLASK ----------------
+app = Flask(__name__, static_folder="static", static_url_path="")
+app.secret_key = os.getenv("FLASK_SECRET", "super-secret-key")
+whoisme_bp = Blueprint("whoisme", __name__)
 
+# ---------------- CACHE ----------------
+SHORT_TERM_CACHE = TTLCache(maxsize=5000, ttl=1800)
+LONG_TERM_CACHE = TTLCache(maxsize=5000, ttl=900)
+PROMPT_CACHE = {"systemPrompt": "", "userPromptFormat": "", "updatedAt": None, "timestamp": 0}
+PERSIONALITY_CACHE = {"data": {}, "updatedAt": None, "lock": threading.Lock()}
+
+EXECUTOR = ThreadPoolExecutor(max_workers=8)
+
+# ---------------- RESPONSE CACHE ----------------
+class ResponseCache:
+    def __init__(self, ttl=120, max_hits=1):
+        self.cache = TTLCache(maxsize=5000, ttl=ttl)
+        self.hits = defaultdict(int)
+        self.max_hits = max_hits
+    def get(self, user_id, session_id, message):
+        key = f"{user_id}_{session_id or 'global'}_{hash(message)}"
+        if key in self.cache and self.hits[key] < self.max_hits:
+            self.hits[key] += 1
+            return self.cache[key]
+        return None
+    def set(self, user_id, session_id, message, response):
+        key = f"{user_id}_{session_id or 'global'}_{hash(message)}"
+        self.cache[key] = response
+        self.hits[key] = 0
+RESPONSE_CACHE = ResponseCache(ttl=120, max_hits=1)
+
+# ---------------- JWT ----------------
 try:
     from utils.jwt_helper import verify_whoisme_token
 except Exception:
@@ -52,166 +71,38 @@ except Exception:
             payload = jwt.decode(token, secret, algorithms=["HS256"])
             return {"userId": payload.get("userId") or payload.get("user_id"), "email": payload.get("email")}
         except Exception as e:
-            print(f"[verify_whoisme_token fallback error]: {e}")
+            logger.error(f"[verify_whoisme_token fallback error]: {e}")
             return None
 
-# ---------------- CONFIG ----------------
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-load_dotenv()
-LOCAL_DB_URL = os.getenv("POSTGRES_URL")
-PROMPT_API_URL = "https://prompt.whoisme.ai/api/public/prompt/chatgpt_prompt_chatbot"
-
-# ---------------- FLASK ----------------
-app = Flask(__name__, static_folder="static", static_url_path="")
-app.secret_key = os.getenv("FLASK_SECRET", "super-secret-key")
-
-# ---------------- CACHE ----------------
-SHORT_TERM_CACHE = TTLCache(maxsize=5000, ttl=1800)  
-LONG_TERM_CACHE = TTLCache(maxsize=5000, ttl=900)   
-PROMPT_CACHE = {"systemPrompt": "", "userPromptFormat": "", "updatedAt": None, "timestamp": 0}
-
-logger = logging.getLogger(__name__)
-PERSIONALITY_CACHE = {"data": {}, "updatedAt": None, "lock": threading.Lock()}
-WHOISME_API_URL = "https://api.whoisme.ai/api/archetype/code/{}"
-
-def fetch_personality_source(archetype_code: str)->dict:
-    if not archetype_code:
-        return {}
+# ---------------- UTILS ----------------
+def to_serializable(obj):
+    if obj is None or isinstance(obj, (str,int,float,bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {k: to_serializable(v) for k,v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [to_serializable(v) for v in obj]
+    if hasattr(obj,"model_name"): return getattr(obj,"model_name")
+    if hasattr(obj,"model"):
+        m = getattr(obj,"model")
+        return m if isinstance(m,(str,int,float,bool)) or m is None else str(m)
     try:
-        resp = requests.get(WHOISME_API_URL.format(archetype_code), timeout=5)
-        resp.raise_for_status()
-        data = resp.json().get("data") or resp.json()
-        translation = data.get("translation") or {}
-        updated_at = data.get("updatedAt") or data.get("updated_at")
+        return str(obj)
+    except Exception:
+        return f"<unserializable:{type(obj).__name__}>"
 
-        with PERSIONALITY_CACHE["lock"]:
-            if PERSIONALITY_CACHE["updatedAt"] != updated_at:
-                persionality = {
-                    "name": translation.get("name") or "",
-                    "color": translation.get("color") or "",
-                    "tone": translation.get("tone") or "",
-                    "style": translation.get("style") or "",
-                    "representativeSpirit": translation.get("representativeSpirit") or "",
-                    "slogan": translation.get("slogan") or "",
-                    "suggestedJobs": translation.get("suggestedJobs") or "",
-                    "strengths": translation.get("strengths") or "",
-                    "weaknesses": translation.get("weaknesses") or "",
-                    "note": translation.get("note") or "",
-                }
-                PERSIONALITY_CACHE["data"] = persionality
-                PERSIONALITY_CACHE["updatedAt"] = updated_at
-                logger.info(f"[PERSIONALITY_CACHE] Updated for {archetype_code} at {updated_at}")
-            else:
-                persionality = PERSIONALITY_CACHE["data"]
-            
-        return persionality
-    except Exception as e:
-        logger.error(f"[fetch_personality_source] Error fetching personality: {e}")
-        return PERSIONALITY_CACHE.get("data") or {}
-
-#-----------------RESPONSE CACHE----------------
-class ResponseCache:
-    def __init__(self, ttl=120, max_hits=1):
-        self.cache = TTLCache(maxsize=5000, ttl=ttl)
-        self.hits = defaultdict(int)
-        self.max_hits = max_hits
-
-    def get(self, user_id, session_id, message):
-        key = f"{user_id}_{session_id or 'global'}_{hash(message)}"
-        if key in self.cache and self.hits[key] < self.max_hits:
-            self.hits[key] += 1
-            print(f"[RESPONSE_CACHE HIT] {key} (hits={self.hits[key]})")
-            return self.cache[key]
-        return None
-
-    def set(self, user_id, session_id, message, response):
-        key = f"{user_id}_{session_id or 'global'}_{hash(message)}"
-        self.cache[key] = response
-        self.hits[key] = 0
-        print(f"[RESPONSE_CACHE SET] {key}")
-
-RESPONSE_CACHE = ResponseCache(ttl=120, max_hits=1)
-
-# ========== BLUEPRINT LOGIN ==========
-from login.register import register_bp
-from login.login import login_bp
-app.register_blueprint(register_bp)
-app.register_blueprint(login_bp)
-
-@app.route("/")
-def index():
-    if not session.get("user"):
-        return redirect("/login-ui")
-    return redirect("/chatbot")
-
-@app.route("/health")
-def health_check():
-    try:
-        # Test database connection
-        conn = get_conn()
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        cursor.fetchone()
-        cursor.close()
-        conn.close()
-        
-        return jsonify({
-            "status": "healthy",
-            "service": "chatbot_base",
-            "database": "connected",
-            "timestamp": None
-        }), 200
-    except Exception as e:
-        return jsonify({
-            "status": "unhealthy", 
-            "service": "chatbot_base",
-            "database": "disconnected",
-            "error": str(e),
-            "timestamp": None
-        }), 500
-
-@app.route("/chatbot")
-def chatbot():
-    if not session.get("user"):
-        return redirect("/login-ui")
-    return app.send_static_file("chatbot_ui.html")
-
-@app.route("/register-ui")
-def register_ui():
-    return app.send_static_file("register.html")
-
-@app.route("/login-ui")
-def login_ui():
-    return app.send_static_file("login.html")
-
-@app.route("/history", methods=["POST"])
-def history():
-    if not session.get("user"):
-        return jsonify([]), 401
-
-    user_id = session["user"]["id"]
-    data = get_long_term_context(user_id)
-
-    if not isinstance(data, list):
-        if data:  
-            data = [data]
-        else:
-            data = []
-
-    return jsonify(data)
-
-# ---------------- PROMPT CACHE ----------------
+# ---------------- PROMPT ----------------
 def fetch_prompt_from_api():
     try:
         resp = requests.get(PROMPT_API_URL, timeout=5)
-        data = resp.json().get("data", {})
+        data = resp.json().get("data",{})
         return {
-            "systemPrompt": data.get("systemPrompt", ""),
-            "userPromptFormat": data.get("userPromptFormat", ""),
-            "updatedAt": data.get("updatedAt"),
+            "systemPrompt": data.get("systemPrompt",""),
+            "userPromptFormat": data.get("userPromptFormat",""),
+            "updatedAt": data.get("updatedAt")
         }
     except Exception as e:
-        print(f"[Prompt Fetch Error]: {e}")
+        logger.error(f"[Prompt Fetch Error]: {e}")
         return PROMPT_CACHE
 
 def background_prompt_updater(interval=300):
@@ -221,11 +112,10 @@ def background_prompt_updater(interval=300):
             if new_data.get("updatedAt") != PROMPT_CACHE.get("updatedAt"):
                 PROMPT_CACHE.update(new_data)
                 PROMPT_CACHE["timestamp"] = time.time()
-                print(f"[Prompt Updated] at {new_data.get('updatedAt')}")
+                logger.info(f"[Prompt Updated] at {new_data.get('updatedAt')}")
         except Exception as e:
-            print(f"[Prompt Updater Error]: {e}")
+            logger.error(f"[Prompt Updater Error]: {e}")
         time.sleep(interval)
-
 threading.Thread(target=background_prompt_updater, daemon=True).start()
 
 def get_cached_prompt():
@@ -234,127 +124,83 @@ def get_cached_prompt():
     data = fetch_prompt_from_api()
     PROMPT_CACHE.update(data)
     PROMPT_CACHE["timestamp"] = time.time()
-    return data.get("systemPrompt", ""), data.get("userPromptFormat", "User said: {{content}}")
+    return data.get("systemPrompt",""), data.get("userPromptFormat","User said: {{content}}")
 
-# ---------------- CONTEXT HELPERS ----------------
+# ---------------- PERSONALITY ----------------
+def fetch_personality_source(archetype_code: str) -> dict:
+    if not archetype_code: return {}
+    try:
+        resp = requests.get(WHOISME_API_URL.format(archetype_code), timeout=5)
+        resp.raise_for_status()
+        data = resp.json().get("data") or resp.json()
+        translation = data.get("translation") or {}
+        updated_at = data.get("updatedAt") or data.get("updated_at")
+        with PERSIONALITY_CACHE["lock"]:
+            if PERSIONALITY_CACHE["updatedAt"] != updated_at:
+                persionality = {k: translation.get(k,"") for k in [
+                    "name","color","tone","style","representativeSpirit","slogan","suggestedJobs","strengths","weaknesses","note"
+                ]}
+                PERSIONALITY_CACHE["data"] = persionality
+                PERSIONALITY_CACHE["updatedAt"] = updated_at
+            else:
+                persionality = PERSIONALITY_CACHE["data"]
+        return persionality
+    except Exception as e:
+        logger.error(f"[fetch_personality_source] {e}")
+        return PERSIONALITY_CACHE.get("data") or {}
+
+# ---------------- CONTEXT ----------------
 def get_short_term(user_id, session_id=None, limit=5, new_message=None, new_reply=None):
     key = f"{user_id}_{session_id or 'global'}"
     if key not in SHORT_TERM_CACHE:
-        messages = deque(get_latest_messages(user_id, session_id, limit), maxlen=limit)
-        SHORT_TERM_CACHE[key] = messages
-    else:
-        messages = SHORT_TERM_CACHE[key]
-
+        SHORT_TERM_CACHE[key] = deque(get_latest_messages(user_id, session_id, limit), maxlen=limit)
+    messages = SHORT_TERM_CACHE[key]
     if new_message and new_reply:
         messages.append({"message": new_message.strip(), "reply": new_reply.strip()})
-
     return list(messages)
 
 def get_long_term(user_id, query, session_id=None, top_k=3, max_chars=300):
     query_hash = hashlib.md5(query.encode("utf-8")).hexdigest()
     key = f"{user_id}_{session_id or 'global'}_{query_hash}"
-
-    if key in LONG_TERM_CACHE:
-        print(f"[CACHE HIT] long_term: {key}")
-        return LONG_TERM_CACHE[key]
-    
-    print(f"[CACHE MISS] long_term: {key}")
+    if key in LONG_TERM_CACHE: return LONG_TERM_CACHE[key]
     candidates = get_long_term_context(user_id, query, session_id=session_id, top_k=top_k) or []
-
-    ranked = sorted(
-        candidates,
-        key=lambda x: 0.7 * x.get("similarity", 0) + 0.3 * x.get("recency", 0),
-        reverse=True
-    )
-    top_contexts = [c.get("text", "").strip()[:max_chars] for c in ranked[:top_k] if c.get("text")]
+    ranked = sorted(candidates, key=lambda x: 0.7*x.get("similarity",0)+0.3*x.get("recency",0), reverse=True)
+    top_contexts = [c.get("text","")[:max_chars] for c in ranked[:top_k] if c.get("text")]
     LONG_TERM_CACHE[key] = top_contexts
     return top_contexts
 
 def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long_top_k=3, max_long_chars=300):
-    results = {"short": [], "long": []}
-    def fetch_short():
-        results["short"] = get_short_term(user_id, session_id, limit=short_limit)
-    def fetch_long():
-        raw_long = get_long_term(user_id, user_msg, session_id=session_id, top_k=long_top_k)
-        results["long"] = [c[:max_long_chars].strip() for c in raw_long if c.strip()]
-
-    t1 = threading.Thread(target=fetch_short)
-    t2 = threading.Thread(target=fetch_long)
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
+    results = {"short":[], "long":[]}
+    t1 = threading.Thread(target=lambda: results.update({"short":get_short_term(user_id, session_id, limit=short_limit)}))
+    t2 = threading.Thread(target=lambda: results.update({"long":[c[:max_long_chars] for c in get_long_term(user_id, user_msg, session_id=session_id, top_k=long_top_k)]}))
+    t1.start(); t2.start(); t1.join(); t2.join()
     return results["short"], results["long"]
 
-import re
-
-def inject_personality(system_prompt: str, personality: dict, userPromptFormat: dict = None) -> str:
-    if not personality and not userPromptFormat:
-        return re.sub(r"%\w+%", "", system_prompt)
-
-    mapping = {
-        "%name%": personality.get("name", ""),
-        "%color%": personality.get("color", ""),
-        "%tone%": personality.get("tone", ""),
-        "%style%": personality.get("style", ""),
-        "%spirit%": personality.get("representativeSpirit", ""),
-        "%slogan%": personality.get("slogan", ""),
-        "%strengths%": personality.get("strengths", ""),
-        "%weaknesses%": personality.get("weaknesses", ""),
-        "%suggestedJobs%": personality.get("suggestedJobs", ""),
-        "%note%": personality.get("note", ""),
-    }
-
+# ---------------- PROMPT INJECTION ----------------
+def inject_personality(system_prompt: str, personality: dict, userPromptFormat: dict=None):
+    mapping = {f"%{k}%":v for k,v in (personality or {}).items()}
     if userPromptFormat:
-        for key, value in userPromptFormat.items():
-            placeholder = f"%{key}%"
-            mapping[placeholder] = value
+        mapping.update({f"%{k}%":v for k,v in userPromptFormat.items()})
+    for k,v in mapping.items(): system_prompt = system_prompt.replace(k,v or "")
+    return re.sub(r"%\w+%","",system_prompt)
 
-    for k, v in mapping.items():
-        system_prompt = system_prompt.replace(k, v or "")
-
-    system_prompt = re.sub(r"%\w+%", "", system_prompt)
-
-    return system_prompt
-
-
-def build_structured_prompt(
-    user_msg,
-    short_msgs,
-    long_context,
-    archetype_code=None,
-    max_long_lines=5
-):
+def build_structured_prompt(user_msg, short_msgs, long_context, archetype_code=None, max_long_lines=5):
     system_prompt, user_prompt_format = get_cached_prompt()
-
     personality = fetch_personality_source(archetype_code) if archetype_code else {}
-    final_system_prompt = inject_personality(system_prompt or "", personality).strip()
-
-    messages = [{"role": "system", "content": final_system_prompt}]
-
+    final_system_prompt = inject_personality(system_prompt, personality)
+    messages = [{"role":"system","content":final_system_prompt}]
     for m in short_msgs:
-        user_msg_short = (m.get("message") or "").strip()
-        reply_short = (m.get("reply") or "").strip()
-        if user_msg_short:
-            messages.append({"role": "user", "content": user_msg_short})
-        if reply_short:
-            messages.append({"role": "assistant", "content": reply_short})
-
+        if m.get("message"): messages.append({"role":"user","content":m.get("message")})
+        if m.get("reply"): messages.append({"role":"assistant","content":m.get("reply")})
     if long_context:
-        long_snippets = long_context[:max_long_lines]
-        messages.append({
-            "role": "system",
-            "content": "LONG-TERM CONTEXT:\n" + "\n".join([c.strip() for c in long_snippets])
-        })
-    formatted_user_msg = (user_prompt_format or "User said: {{content}}").replace(
-        "{{content}}", user_msg.strip()
-    )
-    messages.append({"role": "user", "content": formatted_user_msg})
+        messages.append({"role":"system","content":"LONG-TERM CONTEXT:\n"+ "\n".join(long_context[:max_long_lines])})
+    formatted_user_msg = (user_prompt_format or "User said: {{content}}").replace("{{content}}", user_msg)
+    messages.append({"role":"user","content":formatted_user_msg})
     return messages
 
 # ---------------- ASYNC DB ----------------
 def async_embed_message(user_id, message, reply, session_id=None, time_spent=None):
-    threading.Thread(target=lambda: insert_message(user_id, message, reply, session_id, time_spent), daemon=True).start()
+    EXECUTOR.submit(insert_message, user_id, message, reply, session_id, time_spent)
 
 # ---------------- BLUEPRINT ----------------
 whoisme_bp = Blueprint("whoisme", __name__)
@@ -524,7 +370,6 @@ def whoisme_chat_parallel():
             "update": update_elapsed,
             "cached": False
         },
-        "prompt": messages,
         "message": [
             {"role": "user", "content": user_msg},
             {"role": "assistant", "content": buffer}

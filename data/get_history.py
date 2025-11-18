@@ -2,192 +2,187 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
 from dotenv import load_dotenv
+from cachetools import LRUCache, TTLCache
+from contextlib import contextmanager
 import numpy as np
-from cachetools import TTLCache
-from functools import lru_cache
-import time
 from data.embed_messages import embedder
-from datetime import datetime
-import math
 
 load_dotenv()
-LOCAL_DB_URL = os.getenv("POSTGRES_URL")
 
-def get_conn():
-    return psycopg2.connect(LOCAL_DB_URL, cursor_factory=RealDictCursor)
+# ============================================================
+# POSTGRES CONNECTION POOL
+# ============================================================
+class PostgresPool:
+    def __init__(self, dsn: str, maxconn: int = 10):
+        self.dsn = dsn
+        self.maxconn = maxconn
+        self.pool = []
+        self.used = set()
 
-short_term_cache = TTLCache(maxsize=5000, ttl=300)  # 5 phút
+    def _create_conn(self):
+        return psycopg2.connect(self.dsn, cursor_factory=RealDictCursor)
 
-def get_latest_messages(user_id, session_id=None, limit=10):
-    cache_key = f"{user_id}_{session_id or 'global'}"
-    if cache_key in short_term_cache:
-        return short_term_cache[cache_key]
-
-    try:
-        with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if session_id:
-                cur.execute("""
-                    SELECT id, message, reply, created_at, session_id
-                    FROM whoisme.messages
-                    WHERE user_id = %s 
-                        AND session_id = %s 
-                        AND is_deleted = FALSE
-                    ORDER BY created_at DESC
-                    LIMIT %s;
-                """, (str(user_id), str(session_id), limit))
-            else:
-                cur.execute("""
-                    SELECT id, message, reply, created_at, session_id
-                    FROM whoisme.messages
-                    WHERE user_id = %s 
-                        AND is_deleted = FALSE
-                    ORDER BY created_at DESC
-                    LIMIT %s;
-                """, (str(user_id), limit))
-            rows = cur.fetchall()
-            short_term_cache[cache_key] = rows
-            return rows
-    except Exception as e:
-        print(f"[get_latest_messages] Lỗi: {e}")
-        return []
-
-rag_cache = TTLCache(maxsize=2000, ttl=300)
-
-def to_float_array(vec):
-    if vec is None:
-        return None
-    if isinstance(vec, (list, tuple, np.ndarray)):
-        return np.asarray(vec, dtype=float)
-    if isinstance(vec, str):
+    @contextmanager
+    def get_conn(self):
+        conn = None
         try:
-            return np.asarray(eval(vec), dtype=float)
-        except Exception:
-            return None
-    return None
-
-@lru_cache(maxsize=2000)
-def cached_embed_query(text: str):
-    return embedder.embed(text)
-
-def get_long_term_context(user_id: str, query: str, session_id=None, top_k: int = 5, debug: bool = False):
-    cache_key = f"{user_id}_{session_id or 'global'}_{query}_{top_k}"
-    if cache_key in rag_cache:
-        if debug:
-            print(f"[RAG Cache Hit] {cache_key}")
-        return rag_cache[cache_key]
-
-    start_total = time.time()
-
-    t0 = time.time()
-    q_vec = to_float_array(cached_embed_query(query))
-    embed_time = time.time() - t0
-
-    if q_vec is None:
-        if debug:
-            print("[get_long_term_context] Không tạo được vector query")
-        return ""
-
-    try:
-        with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            t1 = time.time()
-            if session_id:
-                cur.execute("""
-                    SELECT id, message, reply, created_at,
-                        1 - (embedding_vector <=> %s::vector) AS similarity
-                    FROM whoisme.messages
-                    WHERE user_id=%s 
-                        AND session_id=%s
-                        AND embedding_vector IS NOT NULL
-                        AND is_deleted = FALSE
-                    ORDER BY embedding_vector <=> %s::vector
-                    LIMIT %s;
-                """, (q_vec.tolist(), str(user_id), str(session_id), q_vec.tolist(), top_k * 3))
+            if self.pool:
+                conn = self.pool.pop()
             else:
-                cur.execute("""
-                    SELECT id, message, reply, created_at,
-                        1 - (embedding_vector <=> %s::vector) AS similarity
-                    FROM whoisme.messages
-                    WHERE user_id=%s 
-                        AND embedding_vector IS NOT NULL
-                        AND is_deleted = FALSE
-                    ORDER BY embedding_vector <=> %s::vector
-                    LIMIT %s;
-                """, (q_vec.tolist(), str(user_id), q_vec.tolist(), top_k * 3))
+                conn = self._create_conn()
+            self.used.add(conn)
+            yield conn
+        finally:
+            if conn:
+                self.used.discard(conn)
+                self.pool.append(conn)
 
+
+DB_URL = os.getenv("POSTGRES_URL")
+pg_pool = PostgresPool(DB_URL, maxconn=15)
+
+
+# ============================================================
+# CACHES
+# ============================================================
+short_cache = TTLCache(maxsize=1000, ttl=10)
+embedding_cache = LRUCache(maxsize=5000)
+
+
+# ============================================================
+# SQL TEMPLATES
+# ============================================================
+SQL_LATEST_HISTORY = """
+SELECT message, reply, created_at
+FROM whoisme.messages
+WHERE user_id = %s
+    AND is_deleted = FALSE
+ORDER BY created_at DESC
+LIMIT %s
+"""
+
+SQL_VECTOR_SEARCH = """
+SELECT id, message, reply, embedding_vector <=> %s::vector AS distance
+FROM whoisme.messages
+WHERE user_id = %s
+ORDER BY distance ASC
+LIMIT %s
+"""
+
+SQL_SESSION_HISTORY = """
+SELECT id, message, reply, created_at
+FROM whoisme.messages
+WHERE user_id = %s 
+    AND session_id = %s
+    AND is_deleted = FALSE
+ORDER BY created_at ASC
+"""
+
+def get_embedding(text: str):
+    if text in embedding_cache:
+        return embedding_cache[text]
+
+    vec = embedder.embed_cached(text)
+    embedding_cache[text] = vec
+    return vec
+
+
+def get_latest_history(user_id: str, limit: int = 20):
+    cache_key = f"{user_id}:{limit}"
+
+    if cache_key in short_cache:
+        return short_cache[cache_key]
+
+    with pg_pool.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(SQL_LATEST_HISTORY, (user_id, limit))
             rows = cur.fetchall()
-            query_time = time.time() - t1
 
-            if not rows:
-                return ""
+    short_cache[cache_key] = rows
+    return rows
 
-            now = datetime.utcnow()
-            decay_days = 3  
+def _vec_to_pgvector(v):
+    try:
+        if hasattr(v, "tolist"):
+            v = v.tolist()
+        return "[" + ",".join(str(float(x)) for x in v) + "]"
+    except Exception:
+        return "[]"
 
-            def calc_recency_weight(created_at):
-                if not created_at:
-                    return 0.5
-                diff_days = (now - created_at).total_seconds() / 86400
-                return math.exp(-diff_days / decay_days)
+def rag_search(user_id: str, query: str, limit: int = 5):
+    query_vec = get_embedding(query)
+    vec_str = _vec_to_pgvector(query_vec)
 
-            reranked = []
-            for r in rows:
-                recency_weight = calc_recency_weight(r["created_at"])
-                final_score = 0.7 * r["similarity"] + 0.3 * recency_weight
-                r["recency_weight"] = recency_weight
-                r["final_score"] = final_score
-                reranked.append(r)
+    with pg_pool.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(SQL_VECTOR_SEARCH, (vec_str, user_id, limit))
+            rows = cur.fetchall()
 
-            reranked = sorted(reranked, key=lambda x: x["final_score"], reverse=True)[:top_k]
+    if not rows or (rows and rows[0].get("distance", 1.0) > 0.40):
+        return get_latest_history(user_id, limit)
 
-            if debug:
-                total_time = time.time() - start_total
-                print(f"[Embed time] {embed_time:.3f}s")
-                print(f"[Query time] {query_time:.3f}s")
-                print(f"[Total RAG time] {total_time:.3f}s")
-                print("Re-ranked context (top_k):")
-                for r in reranked:
-                    print(f"   🔹 {r['id']} | sim={r['similarity']:.3f} | rec={r['recency_weight']:.3f} | final={r['final_score']:.3f}")
+    return rows
 
-            context_text = "\n".join([
-                f"User: {r['message']}\nBot: {r['reply']}"
-                for r in reranked
-            ])
 
-            rag_cache[cache_key] = context_text
-            return context_text
+def format_messages(rows):
+    formatted = []
+    for r in rows:
+        formatted.append({
+            "user": r.get("message", ""),
+            "bot": r.get("reply", ""),
+            "time": r.get("created_at")
+        })
+    return formatted
 
-    except Exception as e:
-        print(f"[get_long_term_context] Lỗi PostgreSQL: {e}")
-        return ""
+
+def get_context_messages(user_id: str, query: str = "", limit: int = 20):
+    if query and query.strip():
+        rag_rows = rag_search(user_id, query, limit=limit)
+        return format_messages(rag_rows)
+
+    latest = get_latest_history(user_id, limit=limit)
+    return format_messages(latest)
 
 
 def get_full_history(user_id: str, session_id: str):
     try:
-        with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT id, message, reply, created_at
-                FROM whoisme.messages
-                WHERE user_id = %s 
-                    AND session_id = %s
-                    AND is_deleted = FALSE
-                ORDER BY created_at ASC;
-            """, (str(user_id), str(session_id)))
-            rows = cur.fetchall()
+        with pg_pool.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(SQL_SESSION_HISTORY, (str(user_id), str(session_id)))
+                rows = cur.fetchall()
 
-            messages = [
-                {
-                    "id": r["id"],
-                    "message": r["message"],
-                    "reply": r["reply"],
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None
-                }
-                for r in rows
-            ]
-
-            return messages
+        messages = [
+            {
+                "id": r["id"],
+                "message": r["message"],
+                "reply": r["reply"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None
+            } for r in rows
+        ]
+        return messages
     except Exception as e:
         print(f"[get_full_history] Lỗi PostgreSQL: {e}")
         return []
+
+def get_latest_messages(user_id, session_id, limit=20):
+    full = get_full_history(user_id, session_id)
+    return full[-limit:]
+
+
+def get_long_term_context(user_id, query, session_id, top_k=5, debug=False):
+    vec = get_embedding(query)
+    vec_str = _vec_to_pgvector(vec)
+
+    with pg_pool.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(SQL_VECTOR_SEARCH, (vec_str, user_id, top_k))
+            rows = cur.fetchall()
+
+    if debug:
+        print("→ Query vec:", (vec.tolist() if hasattr(vec, "tolist") else vec)[:5], "…")
+        print("→ Rows:", rows)
+
+    return rows
 
 if __name__ == "__main__":
     uid = "1000000405"
