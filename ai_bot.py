@@ -216,7 +216,7 @@ def chat():
         return Response("Message không được để trống", status=400)
     user_id = session["user"]["id"]
     session_id = data.get("session_id")
-    archetype_code = data.get("code")  # UI may send archetype in field "code"
+    archetype_code = data.get("code")  
 
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
     if cached_resp:
@@ -260,7 +260,7 @@ def chat():
     return Response(generate(), mimetype="text/plain")
 
 # ---------------- WHOISME /v1/chat ----------------
-@whoisme_bp.route("/v1/chat", methods=["POST"])
+@whoisme_bp.route("/v1/chatbot", methods=["POST"])
 def whoisme_chat_parallel():
     t0 = time.perf_counter()
 
@@ -281,8 +281,6 @@ def whoisme_chat_parallel():
 
     code_raw = payload.get("code")
     archetype_code = code_raw.strip() if isinstance(code_raw, str) and code_raw.strip() else None
-
-
 
     if not user_msg:
         return jsonify({"error": "Message không được để trống"}), 400
@@ -378,116 +376,112 @@ def whoisme_chat_parallel():
     return Response(json.dumps(to_serializable(payload_out)), mimetype="application/json")
 
 #=========v2=================
-@whoisme_bp.route("/v1/chatbot", methods=["POST"])
+@whoisme_bp.route("/v1/chat", methods=["POST"])
 def whoisme_chat_parallell():
     t0 = time.perf_counter()
 
-    print("==== REQUEST START ====", flush=True)
-    print(f"Path: {request.path}", flush=True)
-    print(f"Method: {request.method}", flush=True)
-    print(f"Headers: {dict(request.headers)}", flush=True)
-    try:
-        payload = request.get_json(force=True)
-    except Exception as e:
-        payload = {}
-        print(f"[ERROR] parsing JSON payload: {e}", flush=True)
-    print(f"Payload: {json.dumps(payload, ensure_ascii=False)}", flush=True)
-    print("==== REQUEST END ====", flush=True)
-
-    # ---- Authentication ----
+    # --- Authentication ---
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
-        print("[AUTH ERROR] Missing or invalid Authorization header", flush=True)
         return jsonify({"error": "Missing or invalid Authorization header"}), 401
-
     token = auth_header.split(" ")[1]
     user_info = verify_whoisme_token(token)
     if not user_info:
-        print("[AUTH ERROR] Invalid token", flush=True)
         return jsonify({"error": "Invalid WhoIsMe token"}), 401
 
     user_id = user_info["userId"]
+    payload = request.get_json(force=True, silent=True) or {}
     user_msg = (payload.get("message") or "").strip()
     session_id = payload.get("session_id")
-    archetype_code = payload.get("code")
-
-    print(f"[INFO] user_id={user_id}, session_id={session_id}, archetype_code={archetype_code}", flush=True)
-    print(f"[INFO] user_msg: {user_msg}", flush=True)
+    code_raw = payload.get("code")
+    archetype_code = code_raw.strip() if isinstance(code_raw, str) and code_raw.strip() else None
 
     if not user_msg:
         return jsonify({"error": "Message không được để trống"}), 400
 
-    # ---- Cache ----
+    # --- Cache check ---
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
     if cached_resp:
-        print(f"[CACHE HIT] {cached_resp}", flush=True)
-        payload_out = {
+        total_elapsed = round(time.perf_counter() - t0, 3)
+        return jsonify({
             "user_id": user_id,
             "session_id": session_id,
             "model": "cache",
             "archetype_code": archetype_code,
-            "cached": True,
+            "elapsed": {
+                "total": total_elapsed,
+                "cached": True
+            },
+            "system_prompt": None,
             "message": [
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": cached_resp}
             ]
-        }
-        print("==== RESPONSE ====", flush=True)
-        print(json.dumps(payload_out, ensure_ascii=False, indent=2), flush=True)
-        print("==== END RESPONSE ====", flush=True)
-        return jsonify(payload_out)
+        })
 
-    # ---- Load model ----
+    # --- Load model ---
     llm = load_prompt_config()
     if not llm:
         return jsonify({"error": "Model không hợp lệ"}), 400
+    model_name = getattr(llm, "model", None) or getattr(llm, "model_name", "Unknown")
 
-    # ---- Build context ----
+    # --- Get context ---
     short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=10, long_top_k=5)
-    messages = build_structured_prompt(user_msg, short_msgs, long_ctx, archetype_code=archetype_code)
-    print("[CONTEXT] Short messages:", flush=True)
-    print(short_msgs, flush=True)
-    print("[CONTEXT] Long messages:", flush=True)
-    print(long_ctx, flush=True)
-    print("[PROMPT] Full structured prompt:", flush=True)
-    print(json.dumps(messages, ensure_ascii=False, indent=2), flush=True)
 
-    # ---- Call model ----
+    # --- Get prompt and personality ---
+    system_prompt, user_prompt_format = get_cached_prompt()
+    personality = fetch_personality_source(archetype_code) if archetype_code else {}
+    final_system_prompt = inject_personality(system_prompt, personality)
+
+    # --- Build structured messages ---
+    messages = [{"role": "system", "content": final_system_prompt}]
+    for m in short_msgs:
+        if m.get("message"):
+            messages.append({"role": "user", "content": m.get("message")})
+        if m.get("reply"):
+            messages.append({"role": "assistant", "content": m.get("reply")})
+    if long_ctx:
+        messages.append({"role": "system", "content": "LONG-TERM CONTEXT:\n" + "\n".join(long_ctx[:5])})
+    formatted_user_msg = (user_prompt_format or "User said: {{content}}").replace("{{content}}", user_msg)
+    messages.append({"role": "user", "content": formatted_user_msg})
+
+    # --- Call model ---
     buffer = ""
+    model_start = time.perf_counter()
     try:
         for chunk in llm.stream(messages):
             content = getattr(chunk, "content", "")
             if content:
                 buffer += content
     except Exception as e:
-        print(f"[MODEL ERROR] {e}", flush=True)
         return jsonify({"error": f"Lỗi khi gọi model: {e}"}), 500
+    model_elapsed = round(time.perf_counter() - model_start, 3)
 
-    # ---- Update caches and DB ----
     try:
         get_short_term(user_id, session_id, limit=10, new_message=user_msg, new_reply=buffer)
     except Exception:
         pass
-    async_embed_message(user_id, user_msg, buffer, session_id=session_id)
+    async_embed_message(user_id, user_msg, buffer, session_id=session_id, time_spent=model_elapsed)
     RESPONSE_CACHE.set(user_id, session_id, user_msg, buffer)
 
-    # ---- Full response log ----
+    # --- Build response ---
+    total_elapsed = round(time.perf_counter() - t0, 3)
     payload_out = {
         "user_id": user_id,
         "session_id": session_id,
-        "model": getattr(llm, "model", getattr(llm, "model_name", "Unknown")),
+        "model": model_name,
         "archetype_code": archetype_code,
+        "system_prompt": final_system_prompt,
         "cached": False,
-        "prompt": messages,
+        "elapsed": {
+            "total": total_elapsed,
+            "model": model_elapsed
+        },
         "message": [
             {"role": "user", "content": user_msg},
             {"role": "assistant", "content": buffer}
         ]
     }
-
-    print("==== RESPONSE ====", flush=True)
-    print(json.dumps(to_serializable(payload_out), ensure_ascii=False, indent=2), flush=True)
-    print("==== END RESPONSE ====", flush=True)
 
     return Response(json.dumps(to_serializable(payload_out)), mimetype="application/json")
 
