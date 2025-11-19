@@ -177,8 +177,8 @@ def get_long_term_context(user_id, query, session_id, top_k=5, debug=False):
     return rows
 
 if __name__ == "__main__":
-    uid = "1000000405"
-    sess = "test-session-001"
+    uid = "1000008808"
+    sess = "42540164-a3ba-448f-9257-108656bf294e"
 
     print("Short-term context")
     short_ctx = get_latest_messages(uid, sess, 5)
@@ -186,5 +186,5 @@ if __name__ == "__main__":
         print(f"User: {row['message']}\nBot: {row['reply']}")
 
     print("\nLong-term context")
-    long_ctx = get_long_term_context(uid, "Đồ ăn healthy là gì", sess, top_k=5, debug=True)
+    long_ctx = get_long_term_context(uid, "Mình là Hương", sess, top_k=5, debug=True)
     print(long_ctx)
