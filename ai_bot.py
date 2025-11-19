@@ -129,27 +129,44 @@ def get_cached_prompt():
 
 # ---------------- PERSONALITY ----------------
 def fetch_personality_source(archetype_code: str) -> dict:
-    if not archetype_code: return {}
+    if not archetype_code:
+        return {}
+
     try:
         resp = requests.get(WHOISME_API_URL.format(archetype_code), timeout=5)
         resp.raise_for_status()
         data = resp.json().get("data") or resp.json()
         translation = data.get("translation") or {}
         updated_at = data.get("updatedAt") or data.get("updated_at")
+
         with PERSIONALITY_CACHE["lock"]:
-            if PERSIONALITY_CACHE["updatedAt"] != updated_at:
-                persionality = {k: translation.get(k,"") for k in [
-                    "name","color","tone","style","representativeSpirit","slogan","suggestedJobs","strengths","weaknesses","note"
-                ]}
+            # Nếu cache cũ hoặc hết hạn, cập nhật
+            if PERSIONALITY_CACHE.get("updatedAt") != updated_at:
+                # Chuẩn hóa key đúng với placeholder
+                keys_map = {
+                    "style": "style",
+                    "tone": "tone",
+                    "spirit": "representativeSpirit",
+                    "name": "name",
+                    "color": "color",
+                    "slogan": "slogan",
+                    "suggestedJobs": "suggestedJobs",
+                    "strengths": "strengths",
+                    "weaknesses": "weaknesses",
+                    "note": "note",
+                }
+                persionality = {k: translation.get(v, "") for k, v in keys_map.items()}
                 PERSIONALITY_CACHE["data"] = persionality
                 PERSIONALITY_CACHE["updatedAt"] = updated_at
             else:
                 persionality = PERSIONALITY_CACHE["data"]
+
         return persionality
+
     except Exception as e:
         logger.error(f"[fetch_personality_source] {e}")
         return PERSIONALITY_CACHE.get("data") or {}
-
+    
 # ---------------- CONTEXT ----------------
 def get_short_term(user_id, session_id=None, limit=5, new_message=None, new_reply=None):
     key = f"{user_id}_{session_id or 'global'}"
@@ -180,9 +197,8 @@ def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long
 # ---------------- PROMPT INJECTION ----------------
 def inject_personality(system_prompt: str, personality: dict, userPromptFormat: dict=None):
     mapping = {f"%{k}%":v for k,v in (personality or {}).items()}
-    if userPromptFormat:
-        mapping.update({f"%{k}%":v for k,v in userPromptFormat.items()})
-    for k,v in mapping.items(): system_prompt = system_prompt.replace(k,v or "")
+    for k,v in mapping.items(): 
+        system_prompt = system_prompt.replace(k,v or "")
     return re.sub(r"%\w+%","",system_prompt)
 
 def build_structured_prompt(user_msg, short_msgs, long_context, archetype_code=None, max_long_lines=5):
