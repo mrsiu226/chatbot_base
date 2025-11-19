@@ -16,6 +16,7 @@ load_dotenv()
 LOCAL_DB_URL = os.getenv("POSTGRES_URL")
 PROMPT_API_URL = "https://prompt.whoisme.ai/api/public/prompt/chatgpt_prompt_chatbot"
 WHOISME_API_URL = "https://api.whoisme.ai/api/archetype/code/{}"
+WHOISME_API_NO_LOGIN_PROMPT = "https://prompt.whoisme.ai/api/public/prompt/prompt_no_login"
 
 # ---------------- LOGGER ----------------
 logger = logging.getLogger(__name__)
@@ -194,7 +195,11 @@ def build_structured_prompt(user_msg, short_msgs, long_context, archetype_code=N
         if m.get("reply"): messages.append({"role":"assistant","content":m.get("reply")})
     if long_context:
         messages.append({"role":"system","content":"LONG-TERM CONTEXT:\n"+ "\n".join(long_context[:max_long_lines])})
-    formatted_user_msg = (user_prompt_format or "User said: {{content}}").replace("{{content}}", user_msg)
+    fmt = user_prompt_format
+    if not isinstance(fmt, str) or not fmt.strip():
+        fmt = "User: {{content}}"
+
+    formatted_user_msg = fmt.replace("{{content}}", user_msg)
     messages.append({"role":"user","content":formatted_user_msg})
     return messages
 
@@ -233,7 +238,7 @@ def chat():
     if not llm:
         return Response("Model không hợp lệ", status=400)
     
-    short_msgs = get_short_term(user_id, session_id, limit=10)
+    short_msgs = get_short_term(user_id, session_id, limit=5)
     long_ctx = get_long_term(user_id, user_msg, session_id=session_id, top_k=5)
     messages = build_structured_prompt(user_msg, short_msgs, long_ctx, archetype_code=archetype_code)
 
@@ -320,7 +325,7 @@ def whoisme_chat_parallel():
     print(f"[MODEL USED] {model_name}", flush=True)
 
     prepare_start = time.perf_counter()
-    short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=10, long_top_k=5)
+    short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=5, long_top_k=5)
     messages = build_structured_prompt(user_msg, short_msgs, long_ctx, archetype_code=archetype_code)
     prepare_elapsed = round(time.perf_counter() - prepare_start, 3)
 
@@ -380,7 +385,6 @@ def whoisme_chat_parallel():
 def whoisme_chat_parallell():
     t0 = time.perf_counter()
 
-    # --- Authentication ---
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return jsonify({"error": "Missing or invalid Authorization header"}), 401
@@ -399,7 +403,6 @@ def whoisme_chat_parallell():
     if not user_msg:
         return jsonify({"error": "Message không được để trống"}), 400
 
-    # --- Cache check ---
     cached_resp = RESPONSE_CACHE.get(user_id, session_id, user_msg)
     if cached_resp:
         total_elapsed = round(time.perf_counter() - t0, 3)
@@ -419,21 +422,17 @@ def whoisme_chat_parallell():
             ]
         })
 
-    # --- Load model ---
     llm = load_prompt_config()
     if not llm:
         return jsonify({"error": "Model không hợp lệ"}), 400
     model_name = getattr(llm, "model", None) or getattr(llm, "model_name", "Unknown")
 
-    # --- Get context ---
-    short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=10, long_top_k=5)
+    short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=5, long_top_k=5)
 
-    # --- Get prompt and personality ---
     system_prompt, user_prompt_format = get_cached_prompt()
     personality = fetch_personality_source(archetype_code) if archetype_code else {}
     final_system_prompt = inject_personality(system_prompt, personality)
 
-    # --- Build structured messages ---
     messages = [{"role": "system", "content": final_system_prompt}]
     for m in short_msgs:
         if m.get("message"):
@@ -445,7 +444,6 @@ def whoisme_chat_parallell():
     formatted_user_msg = (user_prompt_format or "User said: {{content}}").replace("{{content}}", user_msg)
     messages.append({"role": "user", "content": formatted_user_msg})
 
-    # --- Call model ---
     buffer = ""
     model_start = time.perf_counter()
     try:
@@ -464,7 +462,6 @@ def whoisme_chat_parallell():
     async_embed_message(user_id, user_msg, buffer, session_id=session_id, time_spent=model_elapsed)
     RESPONSE_CACHE.set(user_id, session_id, user_msg, buffer)
 
-    # --- Build response ---
     total_elapsed = round(time.perf_counter() - t0, 3)
     payload_out = {
         "user_id": user_id,
@@ -472,6 +469,7 @@ def whoisme_chat_parallell():
         "model": model_name,
         "archetype_code": archetype_code,
         "system_prompt": final_system_prompt,
+        "formatted_user_message": formatted_user_msg,
         "cached": False,
         "elapsed": {
             "total": total_elapsed,
