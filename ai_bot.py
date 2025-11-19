@@ -176,8 +176,7 @@ SHORT_TERM_CACHE = {}
 CACHE_TTL = 30 * 60
 MAX_CACHE_LENGTH = 50
 
-def get_short_term(user_id, session_id=None, limit=10, new_message=None, new_reply=None, force_refresh=False):
-
+def get_short_term(user_id, session_id=None, limit=5, new_message=None, new_reply=None, force_refresh=False):
     user_id_s = str(user_id)
     sess_s = str(session_id) if session_id else "global"
     key = f"{user_id_s}_{sess_s}"
@@ -190,6 +189,8 @@ def get_short_term(user_id, session_id=None, limit=10, new_message=None, new_rep
 
         if force_refresh or key not in SHORT_TERM_CACHE:
             rows = get_latest_messages(user_id_s, session_id, limit) or []
+            # đảo ngược danh sách để newest lên trước
+            rows = list(reversed(rows))
             normalized = deque(maxlen=MAX_CACHE_LENGTH)
             for m in rows:
                 normalized.append({
@@ -198,15 +199,15 @@ def get_short_term(user_id, session_id=None, limit=10, new_message=None, new_rep
                 })
             SHORT_TERM_CACHE[key] = {"messages": normalized, "timestamp": now}
 
-        # append new interaction if provided
         if new_message is not None and new_reply is not None:
-            SHORT_TERM_CACHE[key]["messages"].append({
+            SHORT_TERM_CACHE[key]["messages"].appendleft({
                 "message": new_message,
                 "reply": new_reply
             })
             SHORT_TERM_CACHE[key]["timestamp"] = now
 
-        return list(SHORT_TERM_CACHE[key]["messages"])
+        messages = list(SHORT_TERM_CACHE[key]["messages"])
+        return messages[:limit]
     
 LONG_TERM_LOCK = threading.Lock()
 
