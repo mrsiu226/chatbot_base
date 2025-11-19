@@ -200,6 +200,7 @@ def build_structured_prompt(user_msg, short_msgs, long_context, archetype_code=N
         fmt = "User: {{content}}"
 
     formatted_user_msg = fmt.replace("{{content}}", user_msg)
+    formatted_user_msg = inject_personality(formatted_user_msg, personality)
     messages.append({"role":"user","content":formatted_user_msg})
     return messages
 
