@@ -10,6 +10,7 @@ from model import load_prompt_config
 from data.get_history import get_latest_messages, get_long_term_context, get_full_history
 from data.import_data import insert_message, get_conn
 from data.embed_messages import embedder
+from datetime import datetime
 
 # ---------------- ENV ----------------
 load_dotenv()
@@ -140,9 +141,7 @@ def fetch_personality_source(archetype_code: str) -> dict:
         updated_at = data.get("updatedAt") or data.get("updated_at")
 
         with PERSIONALITY_CACHE["lock"]:
-            # Nếu cache cũ hoặc hết hạn, cập nhật
             if PERSIONALITY_CACHE.get("updatedAt") != updated_at:
-                # Chuẩn hóa key đúng với placeholder
                 keys_map = {
                     "style": "style",
                     "tone": "tone",
@@ -180,10 +179,21 @@ def get_short_term(user_id, session_id=None, limit=5, new_message=None, new_repl
 def get_long_term(user_id, query, session_id=None, top_k=3, max_chars=300):
     query_hash = hashlib.md5(query.encode("utf-8")).hexdigest()
     key = f"{user_id}_{session_id or 'global'}_{query_hash}"
-    if key in LONG_TERM_CACHE: return LONG_TERM_CACHE[key]
+    
+    if key in LONG_TERM_CACHE:
+        return LONG_TERM_CACHE[key]
     candidates = get_long_term_context(user_id, query, session_id=session_id, top_k=top_k) or []
-    ranked = sorted(candidates, key=lambda x: 0.7*x.get("similarity",0)+0.3*x.get("recency",0), reverse=True)
-    top_contexts = [c.get("text","")[:max_chars] for c in ranked[:top_k] if c.get("text")]
+    mapped = []
+    now_ts = datetime.utcnow().timestamp()
+    for r in candidates:
+        created_ts = r.get("created_at").timestamp() if r.get("created_at") else now_ts
+        mapped.append({
+            "text": r.get("message", ""),            
+            "similarity": 1 - r.get("distance", 1), 
+            "recency": 1 / (now_ts - created_ts + 1) 
+        })
+    ranked = sorted(mapped, key=lambda x: 0.7*x["similarity"] + 0.3*x["recency"], reverse=True)
+    top_contexts = [c["text"][:max_chars] for c in ranked[:top_k] if c["text"]]
     LONG_TERM_CACHE[key] = top_contexts
     return top_contexts
 
@@ -197,6 +207,8 @@ def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long
 # ---------------- PROMPT INJECTION ----------------
 def inject_personality(system_prompt: str, personality: dict, userPromptFormat: dict=None):
     mapping = {f"%{k}%":v for k,v in (personality or {}).items()}
+    if isinstance(userPromptFormat, dict):
+        mapping.update({f"%{k}%":v for k,v in userPromptFormat.items()})
     for k,v in mapping.items(): 
         system_prompt = system_prompt.replace(k,v or "")
     return re.sub(r"%\w+%","",system_prompt)
@@ -473,7 +485,7 @@ def whoisme_chat_parallell():
     model_elapsed = round(time.perf_counter() - model_start, 3)
 
     try:
-        get_short_term(user_id, session_id, limit=10, new_message=user_msg, new_reply=buffer)
+        get_short_term(user_id, session_id, limit=5, new_message=user_msg, new_reply=buffer)
     except Exception:
         pass
     async_embed_message(user_id, user_msg, buffer, session_id=session_id, time_spent=model_elapsed)
