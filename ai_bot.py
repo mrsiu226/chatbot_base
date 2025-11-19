@@ -170,34 +170,43 @@ def fetch_personality_source(archetype_code: str) -> dict:
 def _normalize_id(x):
     return str(x) if x is not None else "global"
 
-# đặt lên đầu file gần dòng SHORT_TERM_CACHE
 SHORT_TERM_LOCK = threading.Lock()
 
+SHORT_TERM_CACHE = {}
+CACHE_TTL = 30 * 60
+MAX_CACHE_LENGTH = 50
+
 def get_short_term(user_id, session_id=None, limit=10, new_message=None, new_reply=None, force_refresh=False):
+
     user_id_s = str(user_id)
     sess_s = str(session_id) if session_id else "global"
     key = f"{user_id_s}_{sess_s}"
+    now = time.time()
 
     with SHORT_TERM_LOCK:
-        # load cache nếu chưa có
+        if key in SHORT_TERM_CACHE:
+            if now - SHORT_TERM_CACHE[key]["timestamp"] > CACHE_TTL:
+                del SHORT_TERM_CACHE[key]
+
         if force_refresh or key not in SHORT_TERM_CACHE:
-            rows = get_latest_messages(user_id_s, session_id, limit)
-            normalized = []
+            rows = get_latest_messages(user_id_s, session_id, limit) or []
+            normalized = deque(maxlen=MAX_CACHE_LENGTH)
             for m in rows:
                 normalized.append({
                     "message": m.get("message") or "",
                     "reply": m.get("reply") or ""
                 })
-            SHORT_TERM_CACHE[key] = deque(normalized, maxlen=limit)
+            SHORT_TERM_CACHE[key] = {"messages": normalized, "timestamp": now}
 
-        # push thêm message mới
+        # append new interaction if provided
         if new_message is not None and new_reply is not None:
-            SHORT_TERM_CACHE[key].append({
+            SHORT_TERM_CACHE[key]["messages"].append({
                 "message": new_message,
                 "reply": new_reply
             })
+            SHORT_TERM_CACHE[key]["timestamp"] = now
 
-        return list(SHORT_TERM_CACHE[key])
+        return list(SHORT_TERM_CACHE[key]["messages"])
     
 LONG_TERM_LOCK = threading.Lock()
 
@@ -205,7 +214,6 @@ def get_long_term(user_id, query, session_id=None, top_k=5, max_chars=300):
     user_id_s = str(user_id)
     sess_s = str(session_id) if session_id else "global"
 
-    # dùng query RAW chứ không dùng formatted_user_msg
     query_hash = hashlib.md5(query.encode("utf-8")).hexdigest()
     key = f"{user_id_s}_{sess_s}_{query_hash}"
 
@@ -246,7 +254,6 @@ def get_long_term(user_id, query, session_id=None, top_k=5, max_chars=300):
             "recency": recency
         })
 
-    # sort combined
     ranked = sorted(results, key=lambda x: 0.7 * x["similarity"] + 0.3 * x["recency"], reverse=True)
     top = [r["text"] for r in ranked[:top_k]]
 
