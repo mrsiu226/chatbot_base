@@ -167,42 +167,111 @@ def fetch_personality_source(archetype_code: str) -> dict:
         return PERSIONALITY_CACHE.get("data") or {}
     
 # ---------------- CONTEXT ----------------
-def get_short_term(user_id, session_id=None, limit=5, new_message=None, new_reply=None):
-    key = f"{user_id}_{session_id or 'global'}"
-    if key not in SHORT_TERM_CACHE:
-        SHORT_TERM_CACHE[key] = deque(get_latest_messages(user_id, session_id, limit), maxlen=limit)
-    messages = SHORT_TERM_CACHE[key]
-    if new_message and new_reply:
-        messages.append({"message": new_message.strip(), "reply": new_reply.strip()})
-    return list(messages)
+def _normalize_id(x):
+    return str(x) if x is not None else "global"
 
-def get_long_term(user_id, query, session_id=None, top_k=3, max_chars=300):
-    query_hash = hashlib.md5(query.encode("utf-8")).hexdigest()
-    key = f"{user_id}_{session_id or 'global'}_{query_hash}"
+# đặt lên đầu file gần dòng SHORT_TERM_CACHE
+SHORT_TERM_LOCK = threading.Lock()
+
+def get_short_term(user_id, session_id=None, limit=10, new_message=None, new_reply=None, force_refresh=False):
+    user_id_s = str(user_id)
+    sess_s = str(session_id) if session_id else "global"
+    key = f"{user_id_s}_{sess_s}"
+
+    with SHORT_TERM_LOCK:
+        # load cache nếu chưa có
+        if force_refresh or key not in SHORT_TERM_CACHE:
+            rows = get_latest_messages(user_id_s, session_id, limit)
+            normalized = []
+            for m in rows:
+                normalized.append({
+                    "message": m.get("message") or "",
+                    "reply": m.get("reply") or ""
+                })
+            SHORT_TERM_CACHE[key] = deque(normalized, maxlen=limit)
+
+        # push thêm message mới
+        if new_message is not None and new_reply is not None:
+            SHORT_TERM_CACHE[key].append({
+                "message": new_message,
+                "reply": new_reply
+            })
+
+        return list(SHORT_TERM_CACHE[key])
     
-    if key in LONG_TERM_CACHE:
-        return LONG_TERM_CACHE[key]
-    candidates = get_long_term_context(user_id, query, session_id=session_id, top_k=top_k) or []
-    mapped = []
+LONG_TERM_LOCK = threading.Lock()
+
+def get_long_term(user_id, query, session_id=None, top_k=5, max_chars=300):
+    user_id_s = str(user_id)
+    sess_s = str(session_id) if session_id else "global"
+
+    # dùng query RAW chứ không dùng formatted_user_msg
+    query_hash = hashlib.md5(query.encode("utf-8")).hexdigest()
+    key = f"{user_id_s}_{sess_s}_{query_hash}"
+
+    with LONG_TERM_LOCK:
+        if key in LONG_TERM_CACHE:
+            return LONG_TERM_CACHE[key]
+
+    # query DB
+    rows = get_long_term_context(user_id_s, query, session_id, top_k=top_k) or []
     now_ts = datetime.utcnow().timestamp()
-    for r in candidates:
-        created_ts = r.get("created_at").timestamp() if r.get("created_at") else now_ts
-        mapped.append({
-            "text": r.get("message", ""),            
-            "similarity": 1 - r.get("distance", 1), 
-            "recency": 1 / (now_ts - created_ts + 1) 
+
+    results = []
+    for r in rows:
+        text = r.get("message") or ""
+        
+        score = r.get("score")
+        dist  = r.get("distance")
+
+        # FIX similarity
+        if dist is not None:
+            similarity = 1 - dist
+        elif score is not None:
+            similarity = score
+        else:
+            similarity = 0
+
+        created = r.get("created_at")
+        if hasattr(created, "timestamp"):
+            created_ts = created.timestamp()
+        else:
+            created_ts = now_ts
+
+        recency = 1 / (now_ts - created_ts + 1)
+
+        results.append({
+            "text": text[:max_chars],
+            "similarity": similarity,
+            "recency": recency
         })
-    ranked = sorted(mapped, key=lambda x: 0.7*x["similarity"] + 0.3*x["recency"], reverse=True)
-    top_contexts = [c["text"][:max_chars] for c in ranked[:top_k] if c["text"]]
-    LONG_TERM_CACHE[key] = top_contexts
-    return top_contexts
+
+    # sort combined
+    ranked = sorted(results, key=lambda x: 0.7 * x["similarity"] + 0.3 * x["recency"], reverse=True)
+    top = [r["text"] for r in ranked[:top_k]]
+
+    with LONG_TERM_LOCK:
+        LONG_TERM_CACHE[key] = top
+
+    return top
 
 def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long_top_k=3, max_long_chars=300):
-    results = {"short":[], "long":[]}
-    t1 = threading.Thread(target=lambda: results.update({"short":get_short_term(user_id, session_id, limit=short_limit)}))
-    t2 = threading.Thread(target=lambda: results.update({"long":[c[:max_long_chars] for c in get_long_term(user_id, user_msg, session_id=session_id, top_k=long_top_k)]}))
+    short_msgs_local = []
+    long_msgs_local = []
+
+    def short_fn():
+        nonlocal short_msgs_local
+        short_msgs_local = get_short_term(user_id, session_id, limit=short_limit)
+
+    def long_fn():
+        nonlocal long_msgs_local
+        long_msgs_local = [c[:max_long_chars] for c in get_long_term(user_id, user_msg, session_id=session_id, top_k=long_top_k)]
+
+    t1 = threading.Thread(target=short_fn)
+    t2 = threading.Thread(target=long_fn)
     t1.start(); t2.start(); t1.join(); t2.join()
-    return results["short"], results["long"]
+    return short_msgs_local, long_msgs_local
+
 
 # ---------------- PROMPT INJECTION ----------------
 def inject_personality(system_prompt: str, personality: dict, userPromptFormat: dict=None):
@@ -499,6 +568,8 @@ def whoisme_chat_parallell():
         "archetype_code": archetype_code,
         "system_prompt": final_system_prompt,
         "formatted_user_message": formatted_user_msg,
+        "long_term_context": long_ctx,
+        "short_term_messages": short_msgs,
         "cached": False,
         "elapsed": {
             "total": total_elapsed,
