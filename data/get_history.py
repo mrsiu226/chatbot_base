@@ -8,10 +8,6 @@ import numpy as np
 from data.embed_messages import embedder
 
 load_dotenv()
-
-# ============================================================
-# POSTGRES CONNECTION POOL
-# ============================================================
 class PostgresPool:
     def __init__(self, dsn: str, maxconn: int = 10):
         self.dsn = dsn
@@ -42,20 +38,15 @@ DB_URL = os.getenv("POSTGRES_URL")
 pg_pool = PostgresPool(DB_URL, maxconn=15)
 
 
-# ============================================================
-# CACHES
-# ============================================================
 short_cache = TTLCache(maxsize=1000, ttl=10)
 embedding_cache = LRUCache(maxsize=5000)
 
 
-# ============================================================
-# SQL TEMPLATES
-# ============================================================
 SQL_LATEST_HISTORY = """
 SELECT message, reply, created_at
 FROM whoisme.messages
 WHERE user_id = %s
+    AND session_id = %s
     AND is_deleted = FALSE
 ORDER BY created_at DESC
 LIMIT %s
@@ -65,6 +56,8 @@ SQL_VECTOR_SEARCH = """
 SELECT id, message, reply, embedding_vector <=> %s::vector AS distance
 FROM whoisme.messages
 WHERE user_id = %s
+    AND session_id = %s
+    AND is_deleted = FALSE
 ORDER BY distance ASC
 LIMIT %s
 """
@@ -87,19 +80,20 @@ def get_embedding(text: str):
     return vec
 
 
-def get_latest_history(user_id: str, limit: int = 20):
-    cache_key = f"{user_id}:{limit}"
+def get_latest_history(user_id: str, session_id: str, limit: int = 20):
+    cache_key = f"{user_id}:{session_id}:{limit}"
 
     if cache_key in short_cache:
         return short_cache[cache_key]
 
     with pg_pool.get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(SQL_LATEST_HISTORY, (user_id, limit))
+            cur.execute(SQL_LATEST_HISTORY, (user_id, session_id, limit))
             rows = cur.fetchall()
 
     short_cache[cache_key] = rows
     return rows
+
 
 def _vec_to_pgvector(v):
     try:
@@ -109,20 +103,19 @@ def _vec_to_pgvector(v):
     except Exception:
         return "[]"
 
-def rag_search(user_id: str, query: str, limit: int = 5):
+def rag_search(user_id: str, session_id: str, query: str, limit: int = 5):
     query_vec = get_embedding(query)
     vec_str = _vec_to_pgvector(query_vec)
 
     with pg_pool.get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(SQL_VECTOR_SEARCH, (vec_str, user_id, limit))
+            cur.execute(SQL_VECTOR_SEARCH, (vec_str, user_id, session_id, limit))
             rows = cur.fetchall()
 
     if not rows or (rows and rows[0].get("distance", 1.0) > 0.40):
-        return get_latest_history(user_id, limit)
+        return get_latest_history(user_id, session_id, limit)
 
     return rows
-
 
 def format_messages(rows):
     formatted = []
@@ -135,14 +128,13 @@ def format_messages(rows):
     return formatted
 
 
-def get_context_messages(user_id: str, query: str = "", limit: int = 20):
+def get_context_messages(user_id: str, session_id: str, query: str = "", limit: int = 20):
     if query and query.strip():
-        rag_rows = rag_search(user_id, query, limit=limit)
+        rag_rows = rag_search(user_id, session_id, query, limit=limit)
         return format_messages(rag_rows)
 
-    latest = get_latest_history(user_id, limit=limit)
+    latest = get_latest_history(user_id, session_id, limit=limit)
     return format_messages(latest)
-
 
 def get_full_history(user_id: str, session_id: str):
     try:
@@ -175,7 +167,7 @@ def get_long_term_context(user_id, query, session_id, top_k=5, debug=False):
 
     with pg_pool.get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(SQL_VECTOR_SEARCH, (vec_str, user_id, top_k))
+            cur.execute(SQL_VECTOR_SEARCH, (vec_str, user_id, session_id, top_k))
             rows = cur.fetchall()
 
     if debug:
@@ -188,11 +180,11 @@ if __name__ == "__main__":
     uid = "1000000405"
     sess = "test-session-001"
 
-    print("=== Short-term context ===")
+    print("Short-term context")
     short_ctx = get_latest_messages(uid, sess, 5)
     for row in reversed(short_ctx):
         print(f"User: {row['message']}\nBot: {row['reply']}")
 
-    print("\n=== Long-term context ===")
+    print("\nLong-term context")
     long_ctx = get_long_term_context(uid, "Đồ ăn healthy là gì", sess, top_k=5, debug=True)
     print(long_ctx)
