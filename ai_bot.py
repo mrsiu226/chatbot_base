@@ -209,6 +209,7 @@ def get_short_term(
             })
             SHORT_TERM_CACHE[key]["timestamp"] = now
         return list(SHORT_TERM_CACHE[key]["messages"])
+
     
 LONG_TERM_LOCK = threading.Lock()
 
@@ -216,17 +217,21 @@ def get_long_term(user_id, query, session_id=None, top_k=5, max_chars=300):
     user_id_s = str(user_id)
     sess_s = str(session_id) if session_id else "global"
 
+
     query_hash = hashlib.md5(query.encode("utf-8")).hexdigest()
     key = f"{user_id_s}_{sess_s}_{query_hash}"
 
     with LONG_TERM_LOCK:
-        if key in LONG_TERM_CACHE:
-            return LONG_TERM_CACHE[key]
+        cached = LONG_TERM_CACHE.get(key)
+        if cached:
+            return cached["dicts"]  # trả list of dicts có message + reply
+
     rows = get_long_term_context(user_id_s, query, session_id, top_k=top_k) or []
     now_ts = datetime.utcnow().timestamp()
     results = []
+
     for r in rows:
-        msg = r.get("message") or ""
+        message = r.get("message") or ""
         reply = r.get("reply") or ""
 
         score = r.get("score")
@@ -238,33 +243,31 @@ def get_long_term(user_id, query, session_id=None, top_k=5, max_chars=300):
             similarity = score
         else:
             similarity = 0
+
         created = r.get("created_at")
-        if hasattr(created, "timestamp"):
-            created_ts = created.timestamp()
-        else:
-            created_ts = now_ts
+        created_ts = created.timestamp() if hasattr(created, "timestamp") else now_ts
         recency = 1 / (now_ts - created_ts + 1)
+
         results.append({
-            "message": msg[:max_chars],
+            "message": message[:max_chars],
             "reply": reply[:max_chars],
             "similarity": similarity,
-            "recency": recency,
+            "recency": recency
         })
+
     ranked = sorted(
         results,
         key=lambda x: 0.7 * x["similarity"] + 0.3 * x["recency"],
         reverse=True
     )
-    top = [
-        {
-            "message": r["message"],
-            "reply": r["reply"],
-        }
-        for r in ranked[:top_k]
-    ]
+
+    top_dicts = [{"message": r["message"], "reply": r["reply"]} for r in ranked[:top_k]]
+    top_strings = [r["message"] for r in ranked[:top_k]]  
+
     with LONG_TERM_LOCK:
-        LONG_TERM_CACHE[key] = top
-    return top
+        LONG_TERM_CACHE[key] = {"dicts": top_dicts, "strings": top_strings}
+
+    return top_dicts
 
 def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long_top_k=3, max_long_chars=300):
     short_msgs_local = []
@@ -276,7 +279,12 @@ def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long
 
     def long_fn():
         nonlocal long_msgs_local
-        long_msgs_local = [c[:max_long_chars] for c in get_long_term(user_id, user_msg, session_id=session_id, top_k=long_top_k)]
+    #     long_msgs_local = [c[:max_long_chars] for c in get_long_term(user_id, user_msg, session_id=session_id, top_k=long_top_k)]
+
+        long_msgs_local = [
+        (c["message"] + "\n" + c["reply"])[:max_long_chars] 
+        for c in get_long_term(user_id, user_msg, session_id=session_id, top_k=long_top_k)
+            ]
 
     t1 = threading.Thread(target=short_fn)
     t2 = threading.Thread(target=long_fn)
@@ -536,7 +544,7 @@ def whoisme_chat_parallell():
         return jsonify({"error": "Model không hợp lệ"}), 400
     model_name = getattr(llm, "model", None) or getattr(llm, "model_name", "Unknown")
 
-    short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=5, long_top_k=5)
+    short_msgs, long_ctx = get_context_parallel(user_id, user_msg, session_id, short_limit=5, long_top_k=3)
 
     system_prompt, user_prompt_format = get_cached_prompt()
     personality = fetch_personality_source(archetype_code) if archetype_code else {}
