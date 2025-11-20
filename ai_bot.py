@@ -222,46 +222,48 @@ def get_long_term(user_id, query, session_id=None, top_k=5, max_chars=300):
     with LONG_TERM_LOCK:
         if key in LONG_TERM_CACHE:
             return LONG_TERM_CACHE[key]
-
-    # query DB
     rows = get_long_term_context(user_id_s, query, session_id, top_k=top_k) or []
     now_ts = datetime.utcnow().timestamp()
-
     results = []
     for r in rows:
-        text = r.get("message") or ""
-        
+        msg = r.get("message") or ""
+        reply = r.get("reply") or ""
+
         score = r.get("score")
         dist  = r.get("distance")
 
-        # FIX similarity
         if dist is not None:
             similarity = 1 - dist
         elif score is not None:
             similarity = score
         else:
             similarity = 0
-
         created = r.get("created_at")
         if hasattr(created, "timestamp"):
             created_ts = created.timestamp()
         else:
             created_ts = now_ts
-
         recency = 1 / (now_ts - created_ts + 1)
-
         results.append({
-            "text": text[:max_chars],
+            "message": msg[:max_chars],
+            "reply": reply[:max_chars],
             "similarity": similarity,
-            "recency": recency
+            "recency": recency,
         })
-
-    ranked = sorted(results, key=lambda x: 0.7 * x["similarity"] + 0.3 * x["recency"], reverse=True)
-    top = [r["text"] for r in ranked[:top_k]]
-
+    ranked = sorted(
+        results,
+        key=lambda x: 0.7 * x["similarity"] + 0.3 * x["recency"],
+        reverse=True
+    )
+    top = [
+        {
+            "message": r["message"],
+            "reply": r["reply"],
+        }
+        for r in ranked[:top_k]
+    ]
     with LONG_TERM_LOCK:
         LONG_TERM_CACHE[key] = top
-
     return top
 
 def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long_top_k=3, max_long_chars=300):
