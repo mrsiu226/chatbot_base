@@ -7,7 +7,7 @@ from cachetools import TTLCache
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from model import load_prompt_config
-from data.get_history import get_latest_messages, get_long_term_context, get_full_history
+from data.get_history import get_latest_history, get_long_term_context, get_full_history
 from data.import_data import insert_message, get_conn
 from data.embed_messages import embedder
 from datetime import datetime
@@ -176,7 +176,11 @@ SHORT_TERM_CACHE = {}
 CACHE_TTL = 30 * 60
 MAX_CACHE_LENGTH = 50
 
-def get_short_term(user_id, session_id=None, limit=5, new_message=None, new_reply=None, force_refresh=False):
+def get_short_term(
+    user_id, session_id=None, limit=5,
+    new_message=None, new_reply=None,
+    force_refresh=False
+):
     user_id_s = str(user_id)
     sess_s = str(session_id) if session_id else "global"
     key = f"{user_id_s}_{sess_s}"
@@ -186,28 +190,25 @@ def get_short_term(user_id, session_id=None, limit=5, new_message=None, new_repl
         if key in SHORT_TERM_CACHE:
             if now - SHORT_TERM_CACHE[key]["timestamp"] > CACHE_TTL:
                 del SHORT_TERM_CACHE[key]
-
         if force_refresh or key not in SHORT_TERM_CACHE:
-            rows = get_latest_messages(user_id_s, session_id, limit) or []
-            # đảo ngược danh sách để newest lên trước
-            rows = list(reversed(rows))
-            normalized = deque(maxlen=MAX_CACHE_LENGTH)
+            rows = get_latest_history(user_id_s, session_id, limit) or []
+            normalized = deque(maxlen=limit)
             for m in rows:
                 normalized.append({
-                    "message": m.get("message") or "",
-                    "reply": m.get("reply") or ""
+                    "message": m["message"] or "",
+                    "reply": m["reply"] or ""
                 })
-            SHORT_TERM_CACHE[key] = {"messages": normalized, "timestamp": now}
-
-        if new_message is not None and new_reply is not None:
+            SHORT_TERM_CACHE[key] = {
+                "messages": normalized,
+                "timestamp": now
+            }
+        if new_message and new_reply:
             SHORT_TERM_CACHE[key]["messages"].appendleft({
                 "message": new_message,
                 "reply": new_reply
             })
             SHORT_TERM_CACHE[key]["timestamp"] = now
-
-        messages = list(SHORT_TERM_CACHE[key]["messages"])
-        return messages[:limit]
+        return list(SHORT_TERM_CACHE[key]["messages"])
     
 LONG_TERM_LOCK = threading.Lock()
 
