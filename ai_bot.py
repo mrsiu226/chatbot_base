@@ -561,7 +561,9 @@ def whoisme_chat_parallell():
             messages.append({"role": "assistant", "content": m.get("reply")})
     if long_ctx:
         messages.append({"role": "system", "content": "LONG-TERM CONTEXT:\n" + "\n".join(long_ctx[:5])})
-    formatted_user_msg = (user_prompt_format or "User said: {{content}}").replace("{{content}}", user_msg)
+    fmt = user_prompt_format or "User: {{content}}"
+    fmt = inject_personality(fmt, personality)  
+    formatted_user_msg = fmt.replace("{{content}}", user_msg)
     messages.append({"role": "user", "content": formatted_user_msg})
 
     buffer = ""
