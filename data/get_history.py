@@ -37,10 +37,8 @@ class PostgresPool:
 DB_URL = os.getenv("POSTGRES_URL")
 pg_pool = PostgresPool(DB_URL, maxconn=15)
 
-
-short_cache = TTLCache(maxsize=1000, ttl=10)
+short_cache = {}
 embedding_cache = LRUCache(maxsize=5000)
-
 
 SQL_LATEST_HISTORY = """
 SELECT message, reply, created_at
