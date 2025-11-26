@@ -139,6 +139,10 @@ def fetch_personality_source(archetype_code: str) -> dict:
         data = resp.json().get("data") or resp.json()
         translation = data.get("translation") or {}
         updated_at = data.get("updatedAt") or data.get("updated_at")
+        code = data.get("code") or archetype_code
+
+        mbti_match = re.match(r"[A-Z]+", code)
+        mbti_value = mbti_match.group(0) if mbti_match else ""
 
         with PERSIONALITY_CACHE["lock"]:
             if PERSIONALITY_CACHE.get("updatedAt") != updated_at:
@@ -155,6 +159,8 @@ def fetch_personality_source(archetype_code: str) -> dict:
                     "note": "note",
                 }
                 persionality = {k: translation.get(v, "") for k, v in keys_map.items()}
+                persionality["mbti"] = mbti_value
+                
                 PERSIONALITY_CACHE["data"] = persionality
                 PERSIONALITY_CACHE["updatedAt"] = updated_at
             else:
@@ -227,7 +233,7 @@ def get_long_term(user_id, query, session_id=None, top_k=5, max_chars=300):
     with LONG_TERM_LOCK:
         cached = LONG_TERM_CACHE.get(key)
         if cached:
-            return cached["dicts"]  # trả list of dicts có message + reply
+            return cached["dicts"] 
 
     rows = get_long_term_context(user_id_s, query, session_id, top_k=top_k) or []
     now_ts = datetime.utcnow().timestamp()
@@ -297,12 +303,12 @@ def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long
 
 # ---------------- PROMPT INJECTION ----------------
 def inject_personality(system_prompt: str, personality: dict, userPromptFormat: dict=None):
-    mapping = {f"%{k}%":v for k,v in (personality or {}).items()}
+    mapping = {f"{{{{{k}}}}}":v for k,v in (personality or {}).items()}
     if isinstance(userPromptFormat, dict):
-        mapping.update({f"%{k}%":v for k,v in userPromptFormat.items()})
+        mapping.update({f"{{{{{k}}}}}":v for k,v in userPromptFormat.items()})
     for k,v in mapping.items(): 
         system_prompt = system_prompt.replace(k,v or "")
-    return re.sub(r"%\w+%","",system_prompt)
+    return re.sub(r"{{\w+}}","",system_prompt)
 
 def build_structured_prompt(user_msg, short_msgs, long_context, archetype_code=None, max_long_lines=5):
     system_prompt, user_prompt_format = get_cached_prompt()
