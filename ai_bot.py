@@ -149,7 +149,7 @@ def fetch_personality_source(archetype_code: str) -> dict:
                 keys_map = {
                     "style": "style",
                     "tone": "tone",
-                    "spirit": "representativeSpirit",
+                    "representativeSpirit": "representativeSpirit",
                     "archetypeName": "name",
                     "color": "color",
                     "slogan": "slogan",
