@@ -324,8 +324,11 @@ def build_structured_prompt(user_msg, short_msgs, long_context, archetype_code=N
     if not isinstance(fmt, str) or not fmt.strip():
         fmt = "User: {{content}}"
 
+    fmt = user_prompt_format if isinstance(user_prompt_format, str) and user_prompt_format.strip() else "User: {{content}}"
     formatted_user_msg = fmt.replace("{{content}}", user_msg)
-    formatted_user_msg = inject_personality(formatted_user_msg, personality)
+
+    # formatted_user_msg = fmt.replace("{{content}}", user_msg)
+    # formatted_user_msg = inject_personality(formatted_user_msg, personality)
     messages.append({"role":"user","content":formatted_user_msg})
     return messages
 
