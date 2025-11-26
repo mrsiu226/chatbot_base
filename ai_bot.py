@@ -150,7 +150,7 @@ def fetch_personality_source(archetype_code: str) -> dict:
                     "style": "style",
                     "tone": "tone",
                     "spirit": "representativeSpirit",
-                    "name": "archetypeName",
+                    "archetypeName": "name",
                     "color": "color",
                     "slogan": "slogan",
                     "suggestedJobs": "suggestedJobs",
@@ -256,26 +256,22 @@ def get_long_term(user_id, query, session_id=None, top_k=5, max_chars=300):
         created = r.get("created_at")
         created_ts = created.timestamp() if hasattr(created, "timestamp") else now_ts
         recency = 1 / (now_ts - created_ts + 1)
-
         results.append({
             "message": message[:max_chars],
             "reply": reply[:max_chars],
             "similarity": similarity,
             "recency": recency
         })
-
     ranked = sorted(
         results,
         key=lambda x: 0.7 * x["similarity"] + 0.3 * x["recency"],
         reverse=True
     )
-
     top_dicts = [{"message": r["message"], "reply": r["reply"]} for r in ranked[:top_k]]
     top_strings = [r["message"] for r in ranked[:top_k]]  
 
     with LONG_TERM_LOCK:
         LONG_TERM_CACHE[key] = {"dicts": top_dicts, "strings": top_strings}
-
     return top_dicts
 
 def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long_top_k=3, max_long_chars=300):
@@ -303,12 +299,12 @@ def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long
 
 # ---------------- PROMPT INJECTION ----------------
 def inject_personality(system_prompt: str, personality: dict, userPromptFormat: dict=None):
-    mapping = {f"{{{{{k}}}}}":v for k,v in (personality or {}).items()}
+    mapping = {f"%{k}%":v for k,v in (personality or {}).items()}
     if isinstance(userPromptFormat, dict):
-        mapping.update({f"{{{{{k}}}}}":v for k,v in userPromptFormat.items()})
+        mapping.update({f"%{k}%":v for k,v in userPromptFormat.items()})
     for k,v in mapping.items(): 
         system_prompt = system_prompt.replace(k,v or "")
-    return re.sub(r"{{\w+}}","",system_prompt)
+    return re.sub(r"%\w+%","",system_prompt)
 
 def build_structured_prompt(user_msg, short_msgs, long_context, archetype_code=None, max_long_lines=5):
     system_prompt, user_prompt_format = get_cached_prompt()
@@ -322,12 +318,9 @@ def build_structured_prompt(user_msg, short_msgs, long_context, archetype_code=N
         messages.append({"role":"system","content":"LONG-TERM CONTEXT:\n"+ "\n".join(long_context[:max_long_lines])})
     fmt = user_prompt_format
     if not isinstance(fmt, str) or not fmt.strip():
-        fmt = "User: {{content}}"
+        fmt = "User's question: {{content}}"
 
-    fmt = user_prompt_format if isinstance(user_prompt_format, str) and user_prompt_format.strip() else "User: {{content}}"
     formatted_user_msg = fmt.replace("{{content}}", user_msg)
-
-    # formatted_user_msg = fmt.replace("{{content}}", user_msg)
     # formatted_user_msg = inject_personality(formatted_user_msg, personality)
     messages.append({"role":"user","content":formatted_user_msg})
     return messages
