@@ -150,7 +150,7 @@ def fetch_personality_source(archetype_code: str) -> dict:
                     "style": "style",
                     "tone": "tone",
                     "spirit": "representativeSpirit",
-                    "name": "name",
+                    "name": "archetypeName",
                     "color": "color",
                     "slogan": "slogan",
                     "suggestedJobs": "suggestedJobs",
@@ -160,7 +160,7 @@ def fetch_personality_source(archetype_code: str) -> dict:
                 }
                 persionality = {k: translation.get(v, "") for k, v in keys_map.items()}
                 persionality["mbti"] = mbti_value
-                
+
                 PERSIONALITY_CACHE["data"] = persionality
                 PERSIONALITY_CACHE["updatedAt"] = updated_at
             else:
