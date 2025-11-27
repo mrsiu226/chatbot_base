@@ -15,7 +15,7 @@ from datetime import datetime
 # ---------------- ENV ----------------
 load_dotenv()
 LOCAL_DB_URL = os.getenv("POSTGRES_URL")
-PROMPT_API_URL = "https://prompt.whoisme.ai/api/public/prompt/chatgpt_prompt_chatbot"
+PROMPT_API_URL = "https://prompt.whoisme.ai/api/public/prompt/prompt_chatbot"
 WHOISME_API_URL = "https://api.whoisme.ai/api/archetype/code/{}"
 WHOISME_API_NO_LOGIN_PROMPT = "https://prompt.whoisme.ai/api/public/prompt/prompt_no_login"
 
