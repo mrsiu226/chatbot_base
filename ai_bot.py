@@ -186,39 +186,39 @@ def get_short_term(
     new_message=None, new_reply=None,
     force_refresh=False
 ):
-    user_id_s = str(user_id)
-    sess_s = str(session_id) if session_id else "global"
+    user_id_s = _normalize_id(user_id)
+    sess_s = _normalize_id(session_id)
     key = f"{user_id_s}_{sess_s}"
     now = time.time()
     with SHORT_TERM_LOCK:
-        if key in SHORT_TERM_CACHE:
-            if now - SHORT_TERM_CACHE[key]["timestamp"] > CACHE_TTL:
-                del SHORT_TERM_CACHE[key]
 
-        if force_refresh or key not in SHORT_TERM_CACHE:
+        cache = SHORT_TERM_CACHE.get(key)
+        if cache and (now - cache["timestamp"] > CACHE_TTL):
+            del SHORT_TERM_CACHE[key]
+            cache = None
+
+        if force_refresh or cache is None:
             rows = get_latest_history(user_id_s, session_id, MAX_CACHE_LENGTH) or []
-
             messages = deque(maxlen=MAX_CACHE_LENGTH)
             for m in rows:
                 messages.append({
-                    "message": m["message"] or "",
-                    "reply": m["reply"] or ""
+                    "message": m.get("message", "") or "",
+                    "reply": m.get("reply", "") or "",
                 })
 
             SHORT_TERM_CACHE[key] = {
                 "messages": messages,
                 "timestamp": now
             }
-
+            cache = SHORT_TERM_CACHE[key]
         if new_message is not None and new_reply is not None:
-            SHORT_TERM_CACHE[key]["messages"].appendleft({
+            cache["messages"].append({
                 "message": new_message,
                 "reply": new_reply
             })
-            SHORT_TERM_CACHE[key]["timestamp"] = now
-
-        msgs = SHORT_TERM_CACHE[key]["messages"]
-        return list(msgs)[:limit]
+            cache["timestamp"] = now
+        msgs = list(cache["messages"])[-limit:]
+        return msgs
 
 LONG_TERM_LOCK = threading.Lock()
 
