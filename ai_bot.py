@@ -217,7 +217,9 @@ def get_short_term(
                 "reply": new_reply
             })
             cache["timestamp"] = now
-        msgs = list(cache["messages"])[-limit:]
+        msgs = list(cache["messages"])
+        msgs = msgs[::-1]
+        msgs = msgs[-limit:]
         return msgs
 
 LONG_TERM_LOCK = threading.Lock()
