@@ -298,7 +298,6 @@ def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long
     t1.start(); t2.start(); t1.join(); t2.join()
     return short_msgs_local, long_msgs_local
 
-
 # ---------------- PROMPT INJECTION ----------------
 def inject_personality(system_prompt: str, personality: dict, userPromptFormat: dict=None):
     mapping = {f"%{k}%":v for k,v in (personality or {}).items()}
@@ -658,7 +657,6 @@ def whoisme_history():
 
     user_id = user_info.get("userId")
 
-    # Lấy session_id từ query string hoặc JSON body (an toàn)
     body = request.get_json(silent=True) or {}
     session_id = request.args.get("session_id") or body.get("session_id")
     if not session_id:
