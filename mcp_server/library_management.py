@@ -242,7 +242,7 @@ async def serve() -> None:
         return GetPromptResult(messages=[])
 
     options = server.create_initialization_options()
-    print(f"✅ MCP Library Server is running with options: {options}")
+    print(f"MCP Library Server is running with options: {options}")
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, options)

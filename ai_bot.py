@@ -132,7 +132,6 @@ def get_cached_prompt():
 def fetch_personality_source(archetype_code: str) -> dict:
     if not archetype_code:
         return {}
-
     try:
         resp = requests.get(WHOISME_API_URL.format(archetype_code), timeout=5)
         resp.raise_for_status()
@@ -176,51 +175,74 @@ def fetch_personality_source(archetype_code: str) -> dict:
 def _normalize_id(x):
     return str(x) if x is not None else "global"
 
-SHORT_TERM_LOCK = threading.Lock()
-SHORT_TERM_CACHE = {}
-CACHE_TTL = 30 * 60
-MAX_CACHE_LENGTH = 50
+# SHORT_TERM_LOCK = threading.Lock()
+# SHORT_TERM_CACHE = {}
+# CACHE_TTL = 30 * 60
+# MAX_CACHE_LENGTH = 50
+
+# def get_short_term(
+#     user_id, session_id=None, limit=5,
+#     new_message=None, new_reply=None,
+#     force_refresh=False
+# ):
+#     user_id_s = _normalize_id(user_id)
+#     sess_s = _normalize_id(session_id)
+#     key = f"{user_id_s}_{sess_s}"
+#     now = time.time()
+#     with SHORT_TERM_LOCK:
+
+#         cache = SHORT_TERM_CACHE.get(key)
+#         if cache and (now - cache["timestamp"] > CACHE_TTL):
+#             del SHORT_TERM_CACHE[key]
+#             cache = None
+
+#         if force_refresh or cache is None:
+#             rows = get_latest_history(user_id_s, session_id, MAX_CACHE_LENGTH) or []
+#             messages = deque(maxlen=MAX_CACHE_LENGTH)
+#             for m in rows:
+#                 messages.append({
+#                     "message": m.get("message", "") or "",
+#                     "reply": m.get("reply", "") or "",
+#                 })
+#             SHORT_TERM_CACHE[key] = {
+#                 "messages": messages,
+#                 "timestamp": now
+#             }
+#             cache = SHORT_TERM_CACHE[key]
+#         if new_message is not None and new_reply is not None:
+#             cache["messages"].append({
+#                 "message": new_message,
+#                 "reply": new_reply
+#             })
+#             cache["timestamp"] = now
+#         msgs = list(cache["messages"])
+#         msgs = msgs[::-1]
+#         msgs = msgs[-limit:]
+#         return msgs
 
 def get_short_term(
     user_id, session_id=None, limit=5,
     new_message=None, new_reply=None,
-    force_refresh=False
+    force_refresh=False  
 ):
     user_id_s = _normalize_id(user_id)
     sess_s = _normalize_id(session_id)
-    key = f"{user_id_s}_{sess_s}"
-    now = time.time()
-    with SHORT_TERM_LOCK:
 
-        cache = SHORT_TERM_CACHE.get(key)
-        if cache and (now - cache["timestamp"] > CACHE_TTL):
-            del SHORT_TERM_CACHE[key]
-            cache = None
+    rows = get_latest_history(user_id_s, session_id, limit) or []
 
-        if force_refresh or cache is None:
-            rows = get_latest_history(user_id_s, session_id, MAX_CACHE_LENGTH) or []
-            messages = deque(maxlen=MAX_CACHE_LENGTH)
-            for m in rows:
-                messages.append({
-                    "message": m.get("message", "") or "",
-                    "reply": m.get("reply", "") or "",
-                })
+    messages = []
+    for m in rows:
+        messages.append({
+            "message": m.get("message", "") or "",
+            "reply":   m.get("reply", "") or ""
+        })
 
-            SHORT_TERM_CACHE[key] = {
-                "messages": messages,
-                "timestamp": now
-            }
-            cache = SHORT_TERM_CACHE[key]
-        if new_message is not None and new_reply is not None:
-            cache["messages"].append({
-                "message": new_message,
-                "reply": new_reply
-            })
-            cache["timestamp"] = now
-        msgs = list(cache["messages"])
-        msgs = msgs[::-1]
-        msgs = msgs[-limit:]
-        return msgs
+    if new_message is not None and new_reply is not None:
+        messages.insert(0, {
+            "message": new_message,
+            "reply": new_reply
+        })
+    return messages[:limit]
 
 LONG_TERM_LOCK = threading.Lock()
 
@@ -297,7 +319,6 @@ def get_context_parallel(user_id, user_msg, session_id=None, short_limit=5, long
     t2 = threading.Thread(target=long_fn)
     t1.start(); t2.start(); t1.join(); t2.join()
     return short_msgs_local, long_msgs_local
-
 
 # ---------------- PROMPT INJECTION ----------------
 def inject_personality(system_prompt: str, personality: dict, userPromptFormat: dict=None):
@@ -658,7 +679,6 @@ def whoisme_history():
 
     user_id = user_info.get("userId")
 
-    # Lấy session_id từ query string hoặc JSON body (an toàn)
     body = request.get_json(silent=True) or {}
     session_id = request.args.get("session_id") or body.get("session_id")
     if not session_id:
